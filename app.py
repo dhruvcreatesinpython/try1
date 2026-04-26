@@ -27,6 +27,14 @@ from reportlab.platypus import (
 )
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 
+# Google Sheets integration
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSPREAD_AVAILABLE = True
+except ImportError:
+    GSPREAD_AVAILABLE = False
+
 # Page configuration
 st.set_page_config(
     page_title="Hospital Management System",
@@ -2367,52 +2375,882 @@ def appointment_calendar_page():
             st.info("No appointments match the selected filters.")
 
 
-# ==================== MAIN APP ====================
-def main():
-    login_section()
 
-    if not st.session_state.get('authenticated', False):
-        st.title("🏥 Hospital Management System")
-        st.markdown("""
-        ## Welcome to the Hospital Management System
-        
-        A specialized healthcare platform with AI-powered **Diabetes** and **Hypertension** risk assessment.
-        
-        ### 🔐 Please login to continue
-        Use the sidebar to login with your credentials.
-        
-        ### Demo Credentials:
-        - **Admin:** `admin` / `Admin123!`
-        - **Doctor:** `doctor` / `Admin123!`
-        
-        ### 🚀 Features:
-        - **Diabetes-focused Patient Management** — Complete patient registration with diabetes parameters
-        - **Hypertension Management** — ACC/AHA guideline-based staging and risk stratification
-        - **AI Risk Assessment** — Predictive analytics for both conditions
-        - **Comorbidity Tracking** — Identify patients with both diabetes and hypertension
-        - **Real-time Analytics** — Interactive dashboards and reports
-        - **Secure Access** — Role-based authentication system
+# ==================== GOOGLE SHEETS CONNECTOR ====================
+class GoogleSheetsConnector:
+    """
+    Handles all Google Sheets read/write operations.
+    Uses a service account JSON stored in Streamlit secrets.
 
-        ### 📊 Clinical Parameters Tracked:
-        **Diabetes:** HbA1c, Lipid Profile (Cholesterol, TG, HDL, LDL, VLDL), Kidney Function (Urea, Creatinine), BMI
-        
-        **Hypertension:** Systolic & Diastolic BP, Glucose, Lipid Profile, BMI, Smoking, Physical Activity, Family History
-        """)
+    Sheets used:
+      - 'patient_users'   : user accounts (patient self-registration)
+      - 'patient_data'    : clinical records synced from hospital
+      - 'appointments'    : all appointments (shared with calendar)
+
+    To enable: add credentials to .streamlit/secrets.toml (see SETUP_GUIDE.md).
+    """
+
+    SCOPES = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    SHEET_NAMES = {
+        "users":        "patient_users",
+        "patients":     "patient_data",
+        "appointments": "appointments",
+    }
+
+    def __init__(self):
+        self.client = None
+        self.spreadsheet = None
+        self.enabled = False
+        self._connect()
+
+    def _connect(self):
+        if not GSPREAD_AVAILABLE:
+            return
+        try:
+            creds_dict = dict(st.secrets.get("gcp_service_account", {}))
+            sheet_id   = st.secrets.get("google_sheet_id", "")
+            if not creds_dict or not sheet_id:
+                return
+            creds = Credentials.from_service_account_info(creds_dict, scopes=self.SCOPES)
+            self.client      = gspread.authorize(creds)
+            self.spreadsheet = self.client.open_by_key(sheet_id)
+            self.enabled     = True
+            self._ensure_sheets()
+        except Exception:
+            self.enabled = False
+
+    def _ensure_sheets(self):
+        """Create worksheets if they don't exist yet."""
+        existing = [ws.title for ws in self.spreadsheet.worksheets()]
+        headers  = {
+            "patient_users": [
+                "user_id", "full_name", "email", "phone", "dob",
+                "gender", "password_hash", "patient_id", "created_at",
+            ],
+            "patient_data": [
+                "patient_id", "name", "age", "gender", "email",
+                "HbA1c", "SBP", "DBP", "BMI", "diabetes_condition",
+                "htn_stage", "ckd_egfr", "admission_date",
+            ],
+            "appointments": [
+                "appt_id", "patient_id", "patient_name", "doctor",
+                "date", "time", "duration_mins", "type",
+                "notes", "status", "booked_by",
+            ],
+        }
+        for name, cols in headers.items():
+            if name not in existing:
+                ws = self.spreadsheet.add_worksheet(title=name, rows=1000, cols=len(cols))
+                ws.append_row(cols)
+
+    def _sheet(self, key: str):
+        return self.spreadsheet.worksheet(self.SHEET_NAMES[key])
+
+    # ---- User accounts ----
+    def write_user(self, record: dict) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            ws   = self._sheet("users")
+            cols = ws.row_values(1)
+            row  = [str(record.get(c, "")) for c in cols]
+            ws.append_row(row)
+            return True
+        except Exception:
+            return False
+
+    def get_all_users(self) -> list[dict]:
+        if not self.enabled:
+            return []
+        try:
+            return self._sheet("users").get_all_records()
+        except Exception:
+            return []
+
+    def update_user_row(self, email: str, updates: dict) -> bool:
+        """Update fields for the row matching email."""
+        if not self.enabled:
+            return False
+        try:
+            ws   = self._sheet("users")
+            data = ws.get_all_records()
+            cols = ws.row_values(1)
+            for i, row in enumerate(data):
+                if row.get("email") == email:
+                    row_num = i + 2  # 1-indexed + header
+                    for col_name, val in updates.items():
+                        if col_name in cols:
+                            ws.update_cell(row_num, cols.index(col_name) + 1, str(val))
+            return True
+        except Exception:
+            return False
+
+    # ---- Patient clinical data ----
+    def write_patient(self, patient: dict) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            ws   = self._sheet("patients")
+            cols = ws.row_values(1)
+            da   = patient.get("diabetes_assessment", {})
+            ha   = patient.get("htn_assessment", {})
+            record = {
+                "patient_id":          patient.get("patient_id", ""),
+                "name":                patient.get("name", ""),
+                "age":                 patient.get("age", ""),
+                "gender":              patient.get("gender", ""),
+                "email":               patient.get("email", ""),
+                "HbA1c":               patient.get("HbA1c", ""),
+                "SBP":                 patient.get("SBP", ""),
+                "DBP":                 patient.get("DBP", ""),
+                "BMI":                 patient.get("BMI", ""),
+                "diabetes_condition":  da.get("condition", ""),
+                "htn_stage":           ha.get("stage", ""),
+                "ckd_egfr":            "",
+                "admission_date":      patient.get("admission_date", ""),
+            }
+            row = [str(record.get(c, "")) for c in cols]
+            ws.append_row(row)
+            return True
+        except Exception:
+            return False
+
+    # ---- Appointments ----
+    def write_appointment(self, appt: dict, booked_by: str = "patient") -> bool:
+        if not self.enabled:
+            return False
+        try:
+            ws   = self._sheet("appointments")
+            cols = ws.row_values(1)
+            appt["booked_by"] = booked_by
+            row = [str(appt.get(c, "")) for c in cols]
+            ws.append_row(row)
+            return True
+        except Exception:
+            return False
+
+    def get_appointments(self) -> list[dict]:
+        if not self.enabled:
+            return []
+        try:
+            return self._sheet("appointments").get_all_records()
+        except Exception:
+            return []
+
+
+# ==================== PATIENT USER STORE ====================
+class PatientUserStore:
+    """
+    In-memory patient account store (source of truth at runtime).
+    Syncs new registrations / updates to Google Sheets when available.
+    """
+
+    def __init__(self, sheets: GoogleSheetsConnector):
+        self.sheets = sheets
+        self.users: list[dict] = []
+        self._load_from_sheets()
+        self._seed_demo()
+
+    def _load_from_sheets(self):
+        remote = self.sheets.get_all_users()
+        if remote:
+            self.users = remote
+
+    def _seed_demo(self):
+        """Pre-create one demo patient account linked to PAT0001."""
+        if any(u["email"] == "john.smith@demo.com" for u in self.users):
+            return
+        demo = {
+            "user_id":       "USR0001",
+            "full_name":     "John Smith",
+            "email":         "john.smith@demo.com",
+            "phone":         "+91-9876543210",
+            "dob":           "1979-03-15",
+            "gender":        "Male",
+            "password_hash": security.hash_password("Patient123!"),
+            "patient_id":    "PAT0001",
+            "created_at":    "2024-01-10 09:00",
+        }
+        self.users.append(demo)
+
+    # ---- Registration ----
+    def register(self, full_name: str, email: str, phone: str,
+                  dob: str, gender: str, password: str) -> tuple[bool, str]:
+        if any(u["email"] == email for u in self.users):
+            return False, "An account with this email already exists."
+
+        # Match to existing hospital patient record by name + DOB (simple heuristic)
+        linked_pid = ""
+        for p in hospital_data.patients:
+            if p["name"].lower() == full_name.lower():
+                linked_pid = p["patient_id"]
+                break
+
+        user_id = f"USR{len(self.users)+1:04d}"
+        record  = {
+            "user_id":       user_id,
+            "full_name":     full_name,
+            "email":         email,
+            "phone":         phone,
+            "dob":           dob,
+            "gender":        gender,
+            "password_hash": security.hash_password(password),
+            "patient_id":    linked_pid,
+            "created_at":    datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        self.users.append(record)
+        self.sheets.write_user(record)
+        return True, user_id
+
+    # ---- Auth ----
+    def authenticate(self, email: str, password: str) -> tuple[bool, dict | None]:
+        for u in self.users:
+            if u["email"] == email:
+                if security.verify_password(password, u["password_hash"]):
+                    return True, u
+                return False, None
+        return False, None
+
+    def get_by_email(self, email: str) -> dict | None:
+        return next((u for u in self.users if u["email"] == email), None)
+
+    # ---- Update ----
+    def update_profile(self, email: str, updates: dict) -> bool:
+        for u in self.users:
+            if u["email"] == email:
+                u.update(updates)
+                self.sheets.update_user_row(email, updates)
+                return True
+        return False
+
+    def change_password(self, email: str, old_pw: str, new_pw: str) -> tuple[bool, str]:
+        ok, user = self.authenticate(email, old_pw)
+        if not ok:
+            return False, "Current password is incorrect."
+        new_hash = security.hash_password(new_pw)
+        self.update_profile(email, {"password_hash": new_hash})
+        return True, "Password changed successfully."
+
+
+# ---- Initialise global stores ----
+gs_connector   = GoogleSheetsConnector()
+patient_users  = PatientUserStore(gs_connector)
+
+
+# ==================== PATIENT PORTAL PAGES ====================
+
+def _patient_sidebar():
+    u = st.session_state.get("patient_user", {})
+    st.sidebar.success(f"👤 {u.get('full_name', 'Patient')}")
+    st.sidebar.caption(f"📧 {u.get('email', '')}")
+    if u.get("patient_id"):
+        st.sidebar.info(f"🆔 Hospital ID: {u['patient_id']}")
+    else:
+        st.sidebar.warning("Not yet linked to a hospital record")
+    if st.sidebar.button("🚪 Sign Out"):
+        for k in ["patient_authenticated", "patient_user"]:
+            st.session_state.pop(k, None)
+        st.rerun()
+
+
+def patient_portal_landing():
+    """Tabbed Register / Login for the patient-facing portal."""
+    st.title("🏥 Patient Portal")
+    st.markdown("Book appointments, view your clinical reports and medications — all in one place.")
+
+    tab_login, tab_register = st.tabs(["🔑 Sign In", "📝 Create Account"])
+
+    # ---- Sign In ----
+    with tab_login:
+        st.subheader("Welcome back")
+        with st.form("patient_login_form"):
+            email    = st.text_input("Email Address")
+            password = st.text_input("Password", type="password")
+            submit   = st.form_submit_button("Sign In →")
+
+        if submit:
+            if not email or not password:
+                st.error("Please enter your email and password.")
+            else:
+                ok, user = patient_users.authenticate(email, password)
+                if ok:
+                    st.session_state.patient_authenticated = True
+                    st.session_state.patient_user          = user
+                    st.success(f"Welcome back, {user['full_name']}!")
+                    st.rerun()
+                else:
+                    st.error("Invalid email or password.")
+
+        st.markdown("---")
+        st.caption("**Demo account:** john.smith@demo.com / Patient123!")
+
+    # ---- Register ----
+    with tab_register:
+        st.subheader("Create your patient account")
+        st.info(
+            "ℹ️  If you are already a registered patient at our hospital, "
+            "use the same name as on your hospital record — we will link your "
+            "account automatically."
+        )
+        with st.form("patient_register_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                full_name = st.text_input("Full Name *")
+                email_r   = st.text_input("Email Address *")
+                phone     = st.text_input("Phone Number", placeholder="+91-XXXXXXXXXX")
+            with col2:
+                dob       = st.date_input("Date of Birth *",
+                                           min_value=datetime(1920, 1, 1).date(),
+                                           max_value=datetime.now().date())
+                gender_r  = st.selectbox("Gender *", ["Male", "Female", "Other"])
+                pw1       = st.text_input("Password *", type="password",
+                                           help="Min 8 characters, include a number")
+                pw2       = st.text_input("Confirm Password *", type="password")
+
+            agreed = st.checkbox("I agree to the terms and consent to storage of my health data.")
+            submit_r = st.form_submit_button("Create Account →")
+
+        if submit_r:
+            errors = []
+            if not full_name:  errors.append("Full name is required.")
+            if not email_r:    errors.append("Email is required.")
+            if not pw1:        errors.append("Password is required.")
+            if pw1 != pw2:     errors.append("Passwords do not match.")
+            if len(pw1) < 8:   errors.append("Password must be at least 8 characters.")
+            if not agreed:     errors.append("You must agree to the terms to continue.")
+            if errors:
+                for e in errors:
+                    st.error(e)
+            else:
+                ok, result = patient_users.register(
+                    full_name=full_name, email=email_r, phone=phone,
+                    dob=str(dob), gender=gender_r, password=pw1,
+                )
+                if ok:
+                    st.success(
+                        f"✅ Account created! Your User ID is **{result}**.  \n"
+                        "Please sign in using the **Sign In** tab."
+                    )
+                    # Sync new user to Google Sheets
+                    if gs_connector.enabled:
+                        st.info("📊 Your details have been saved to the hospital records system.")
+                    else:
+                        st.warning(
+                            "⚠️  Google Sheets sync is not configured — your account is "
+                            "saved locally for this session only. Ask the admin to set up "
+                            "Google Sheets integration."
+                        )
+                else:
+                    st.error(result)
+
+
+def patient_home(user: dict):
+    """Dashboard shown immediately after patient login."""
+    pid = user.get("patient_id", "")
+    patient_record = next(
+        (p for p in hospital_data.patients if p["patient_id"] == pid), None
+    )
+
+    st.title(f"👋 Welcome, {user['full_name']}")
+    st.caption(f"Last login: {datetime.now().strftime('%A, %d %B %Y %H:%M')}")
+
+    if not patient_record:
+        st.warning(
+            "Your account is not yet linked to a hospital patient record. "
+            "If you recently registered at the hospital, please ask the front desk "
+            "to link your account (User ID: **" + user.get('user_id', '') + "**)."
+        )
+        # Still show appointment booking
+        st.markdown("---")
+        st.subheader("📅 Book an Appointment")
+        _patient_book_appointment_widget(user)
         return
 
-    st.sidebar.title("Navigation")
-    page = st.sidebar.radio("Go to", ["Dashboard", "Patient Management", "AI Predictions"])
+    # ---- Summary cards ----
+    da  = patient_record.get("diabetes_assessment", {})
+    ha  = patient_record.get("htn_assessment", {})
+    ckd = ckd_screener.calculate(
+        creatinine_umol=patient_record.get("Cr", 70),
+        age=patient_record.get("age", 50),
+        gender=patient_record.get("gender", "Male"),
+    )
 
-    if page == "Dashboard":
-        main_dashboard()
-    elif page == "Patient Management":
-        patient_management()
-    elif page == "AI Predictions":
-        ai_predictions()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Diabetes Status",  da.get("condition",  "N/A"))
+    c2.metric("Hypertension",     ha.get("stage",      "N/A"))
+    c3.metric("eGFR (Kidney)",    f"{ckd.get('egfr', 'N/A')} mL/min")
+    c4.metric("BMI",              patient_record.get("BMI", "N/A"))
 
-    st.sidebar.markdown("---")
-    st.sidebar.info(f"**Patients:** {len(hospital_data.patients)}")
-    st.sidebar.info(f"**Last Update:** {datetime.now().strftime('%H:%M')}")
+    # ---- Upcoming appointments ----
+    st.markdown("---")
+    st.subheader("📅 Your Upcoming Appointments")
+    my_appts = [
+        a for a in appointment_calendar.for_patient(pid)
+        if a["date"] >= str(datetime.now().date()) and a["status"] == "Scheduled"
+    ]
+    if my_appts:
+        for a in my_appts[:3]:
+            st.info(
+                f"🕐 **{a['date']} at {a['time']}** — {a['type']}  \n"
+                f"🩺 {a['doctor']} | {a['duration_mins']} mins"
+            )
+    else:
+        st.info("No upcoming appointments. Book one below.")
+
+    st.markdown("---")
+    st.subheader("📅 Book a New Appointment")
+    _patient_book_appointment_widget(user)
+
+
+def _patient_book_appointment_widget(user: dict):
+    """Reusable appointment booking widget for patient portal."""
+    pid  = user.get("patient_id", "")
+    name = user.get("full_name", "")
+
+    with st.form("patient_appt_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            appt_date = st.date_input(
+                "Preferred Date *",
+                value=datetime.now().date() + timedelta(days=1),
+                min_value=datetime.now().date(),
+            )
+            appt_time = st.time_input(
+                "Preferred Time *",
+                value=datetime.strptime("09:00", "%H:%M").time(),
+            )
+            doctor = st.selectbox("Preferred Doctor", AppointmentCalendar.DOCTORS)
+        with col2:
+            appt_type = st.selectbox("Appointment Type", AppointmentCalendar.APPT_TYPES)
+            duration  = st.selectbox("Duration (minutes)",
+                                      AppointmentCalendar.DURATIONS, index=2)
+            notes     = st.text_area("Reason / Notes",
+                                      placeholder="Brief reason for visit…", height=90)
+
+        submit = st.form_submit_button("📅 Book Appointment")
+
+    if submit:
+        conflict = any(
+            a["doctor"] == doctor
+            and a["time"]   == appt_time.strftime("%H:%M")
+            and a["date"]   == str(appt_date)
+            and a["status"] == "Scheduled"
+            for a in appointment_calendar.appointments
+        )
+        if conflict:
+            st.error(
+                f"⚠️  {doctor} is already booked at "
+                f"{appt_time.strftime('%H:%M')} on {appt_date}. "
+                "Please choose a different time or doctor."
+            )
+        else:
+            record = {
+                "patient_id":   pid  or "UNLINKED",
+                "patient_name": name or user.get("full_name", ""),
+                "doctor":       doctor,
+                "date":         str(appt_date),
+                "time":         appt_time.strftime("%H:%M"),
+                "duration_mins":duration,
+                "type":         appt_type,
+                "notes":        notes,
+                "status":       "Scheduled",
+            }
+            appt_id = appointment_calendar.add(record)
+            gs_connector.write_appointment(record, booked_by="patient")
+            st.success(
+                f"✅ Appointment booked! **ID: {appt_id}**  \n"
+                f"📅 {appt_date.strftime('%A, %d %B %Y')} at "
+                f"{appt_time.strftime('%H:%M')} with **{doctor}**"
+            )
+            st.balloons()
+
+
+def patient_my_reports(user: dict):
+    pid = user.get("patient_id", "")
+    patient_record = next(
+        (p for p in hospital_data.patients if p["patient_id"] == pid), None
+    )
+
+    st.title("📋 My Clinical Reports")
+
+    if not patient_record:
+        st.warning("No clinical record linked to your account yet.")
+        return
+
+    # ---- Diabetes ----
+    da = patient_record.get("diabetes_assessment", {})
+    st.subheader("🩺 Diabetes Assessment")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Status",              da.get("condition",              "N/A"))
+    c2.metric("Risk Category",       da.get("risk_category",          "N/A"))
+    c3.metric("Diabetes Probability",f"{da.get('probability_diabetes',0)*100:.1f}%")
+
+    prob_fig = px.bar(
+        pd.DataFrame({
+            "Category":    ["No Diabetes", "Pre-Diabetes", "Diabetes"],
+            "Probability": [
+                da.get("probability_no_diabetes", 0) * 100,
+                da.get("probability_pre_diabetes", 0) * 100,
+                da.get("probability_diabetes",     0) * 100,
+            ],
+        }),
+        x="Category", y="Probability",
+        color="Category",
+        color_discrete_sequence=["#27ae60", "#e67e22", "#e74c3c"],
+        title="Diabetes Risk Probability (%)",
+    )
+    prob_fig.update_layout(showlegend=False)
+    st.plotly_chart(prob_fig, use_container_width=True)
+
+    if da.get("key_factors"):
+        st.warning("⚠️  Risk Factors: " + ", ".join(da["key_factors"]))
+    st.info("💡 " + " | ".join(da.get("recommendations", [])))
+
+    st.markdown("---")
+
+    # ---- Hypertension ----
+    ha = patient_record.get("htn_assessment", {})
+    st.subheader("❤️ Hypertension Assessment")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Stage",         ha.get("stage",         "N/A"))
+    c2.metric("Risk Category", ha.get("risk_category", "N/A"))
+    c3.metric("Blood Pressure",
+              f"{patient_record.get('SBP','?')}/{patient_record.get('DBP','?')} mmHg")
+
+    if ha.get("key_factors"):
+        st.warning("⚠️  Risk Factors: " + ", ".join(ha["key_factors"]))
+    st.info("💡 " + " | ".join(ha.get("recommendations", [])))
+
+    st.markdown("---")
+
+    # ---- CKD ----
+    ckd = ckd_screener.calculate(
+        creatinine_umol=patient_record.get("Cr", 70),
+        age=patient_record.get("age", 50),
+        gender=patient_record.get("gender", "Male"),
+    )
+    st.subheader("🫘 Kidney (CKD) Screening")
+    c1, c2 = st.columns(2)
+    c1.metric("eGFR",      f"{ckd.get('egfr', 'N/A')} mL/min/1.73m²")
+    c2.metric("CKD Stage", ckd.get("stage_label", "N/A"))
+    st.info(f"📋 {ckd.get('action', '')}")
+    if ckd.get("flags"):
+        for f in ckd["flags"]:
+            st.error(f"🚨 {f}")
+
+    st.markdown("---")
+
+    # ---- Download PDF ----
+    st.subheader("📄 Download Full Report")
+    if st.button("⬇️ Generate & Download PDF"):
+        with st.spinner("Generating PDF…"):
+            try:
+                pdf_bytes = report_generator.generate(patient_record)
+                st.download_button(
+                    "Download PDF Report",
+                    data=pdf_bytes,
+                    file_name=f"MyReport_{pid}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                    mime="application/pdf",
+                )
+            except Exception as e:
+                st.error(f"PDF error: {e}")
+
+
+def patient_my_medications(user: dict):
+    pid = user.get("patient_id", "")
+    st.title("💊 My Medications")
+
+    meds = medication_log.for_patient(pid) if pid else []
+    active   = [m for m in meds if m.get("active")]
+    inactive = [m for m in meds if not m.get("active")]
+
+    if not meds:
+        st.info("No medications recorded for your account yet.")
+        return
+
+    c1, c2 = st.columns(2)
+    c1.metric("Active Prescriptions", len(active))
+    c2.metric("Discontinued",         len(inactive))
+
+    if active:
+        st.subheader("✅ Current Prescriptions")
+        for m in active:
+            adh_icon = {
+                "Good (>80%)":      "🟢",
+                "Moderate (50–80%)":"🟡",
+                "Poor (<50%)":      "🔴",
+                "Unknown":          "⚪",
+            }.get(m.get("adherence", "Unknown"), "⚪")
+            with st.expander(
+                f"{adh_icon} **{m['drug_name']}** {m['dose']} — {m['frequency']}"
+            ):
+                c1, c2 = st.columns(2)
+                c1.write(f"**Route:** {m['route']}")
+                c1.write(f"**Indication:** {m['indication']}")
+                c2.write(f"**Prescriber:** {m['prescriber']}")
+                c2.write(f"**Since:** {m['start_date']}")
+                c2.write(f"**Adherence:** {m.get('adherence','Unknown')}")
+                if m.get("notes"):
+                    st.info(f"📝 {m['notes']}")
+
+    if inactive:
+        st.subheader("🗂️ Past Medications")
+        df = pd.DataFrame([{
+            "Drug":      m["drug_name"],
+            "Dose":      m["dose"],
+            "Indication":m["indication"],
+            "Started":   m["start_date"],
+            "Ended":     m["end_date"],
+        } for m in inactive])
+        st.dataframe(df, use_container_width=True)
+
+
+def patient_my_appointments(user: dict):
+    pid  = user.get("patient_id",  "")
+    name = user.get("full_name",   "")
+    st.title("📅 My Appointments")
+
+    tab1, tab2 = st.tabs(["📋 My Schedule", "➕ Book New Appointment"])
+
+    with tab1:
+        appts = appointment_calendar.for_patient(pid) if pid else []
+        today_str = str(datetime.now().date())
+
+        upcoming = [a for a in appts if a["date"] >= today_str]
+        past     = [a for a in appts if a["date"] <  today_str]
+
+        st.subheader("📆 Upcoming")
+        if upcoming:
+            for a in upcoming:
+                status_icon = {
+                    "Scheduled": "🔵",
+                    "Completed": "🟢",
+                    "Cancelled": "🔴",
+                    "No Show":   "⚫",
+                }.get(a["status"], "⚪")
+                st.info(
+                    f"{status_icon} **{a['date']} at {a['time']}** — "
+                    f"{a['type']}  \n"
+                    f"🩺 {a['doctor']} | {a['duration_mins']} mins | "
+                    f"Status: **{a['status']}**"
+                    + (f"  \n📝 {a['notes']}" if a.get("notes") else "")
+                )
+        else:
+            st.info("No upcoming appointments.")
+
+        if past:
+            st.subheader("🗂️ Past Appointments")
+            df = pd.DataFrame([{
+                "Date":     a["date"],
+                "Time":     a["time"],
+                "Type":     a["type"],
+                "Doctor":   a["doctor"],
+                "Status":   a["status"],
+            } for a in past])
+            st.dataframe(df, use_container_width=True)
+
+    with tab2:
+        st.subheader("Book a New Appointment")
+        _patient_book_appointment_widget(user)
+
+
+def patient_my_profile(user: dict):
+    st.title("👤 My Profile")
+
+    tab1, tab2 = st.tabs(["✏️ Edit Profile", "🔒 Change Password"])
+
+    with tab1:
+        with st.form("profile_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                new_name  = st.text_input("Full Name",  value=user.get("full_name", ""))
+                new_phone = st.text_input("Phone",       value=user.get("phone", ""))
+            with col2:
+                new_dob   = st.text_input("Date of Birth (YYYY-MM-DD)",
+                                           value=user.get("dob", ""))
+                new_gender= st.selectbox(
+                    "Gender",
+                    ["Male", "Female", "Other"],
+                    index=["Male", "Female", "Other"].index(
+                        user.get("gender", "Male")
+                        if user.get("gender", "Male") in ["Male", "Female", "Other"]
+                        else "Male"
+                    ),
+                )
+            save = st.form_submit_button("💾 Save Changes")
+
+        if save:
+            updates = {
+                "full_name": new_name,
+                "phone":     new_phone,
+                "dob":       new_dob,
+                "gender":    new_gender,
+            }
+            patient_users.update_profile(user["email"], updates)
+            st.session_state.patient_user.update(updates)
+            st.success("✅ Profile updated successfully!")
+
+        # Read-only info
+        st.markdown("---")
+        st.markdown("**Account Information**")
+        c1, c2 = st.columns(2)
+        c1.write(f"**User ID:** {user.get('user_id', 'N/A')}")
+        c1.write(f"**Email:** {user.get('email', 'N/A')}")
+        c2.write(f"**Hospital Patient ID:** {user.get('patient_id', 'Not linked')}")
+        c2.write(f"**Account Created:** {user.get('created_at', 'N/A')}")
+
+        if gs_connector.enabled:
+            st.success("📊 Your data is synced with the hospital Google Sheet.")
+        else:
+            st.warning(
+                "⚠️  Google Sheets sync is not active. "
+                "Contact the hospital admin to enable it."
+            )
+
+    with tab2:
+        with st.form("pw_form"):
+            old_pw  = st.text_input("Current Password",  type="password")
+            new_pw1 = st.text_input("New Password",       type="password")
+            new_pw2 = st.text_input("Confirm New Password", type="password")
+            change  = st.form_submit_button("🔒 Change Password")
+
+        if change:
+            if new_pw1 != new_pw2:
+                st.error("New passwords do not match.")
+            elif len(new_pw1) < 8:
+                st.error("Password must be at least 8 characters.")
+            else:
+                ok, msg = patient_users.change_password(user["email"], old_pw, new_pw1)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+
+
+def patient_portal_app():
+    """Full patient portal router — called when portal tab is active."""
+    if not st.session_state.get("patient_authenticated"):
+        patient_portal_landing()
+        return
+
+    user = st.session_state.patient_user
+    _patient_sidebar()
+
+    st.sidebar.title("My Portal")
+    page = st.sidebar.radio(
+        "Navigate to",
+        ["🏠 Dashboard", "📋 My Reports",
+         "💊 My Medications", "📅 My Appointments", "👤 My Profile"],
+    )
+
+    if page == "🏠 Dashboard":
+        patient_home(user)
+    elif page == "📋 My Reports":
+        patient_my_reports(user)
+    elif page == "💊 My Medications":
+        patient_my_medications(user)
+    elif page == "📅 My Appointments":
+        patient_my_appointments(user)
+    elif page == "👤 My Profile":
+        patient_my_profile(user)
+
+# ==================== MAIN APP ====================
+def main():
+    """
+    Landing router:
+    - Shows two top-level tabs: Staff Portal | Patient Portal
+    - Staff tab uses the existing admin/doctor login (sidebar)
+    - Patient tab has its own register/login flow
+    """
+
+    # ---- Top-level tab selector ----
+    # Only show on the unauthenticated landing; once logged in each portal
+    # controls its own navigation.
+    staff_auth   = st.session_state.get("authenticated",         False)
+    patient_auth = st.session_state.get("patient_authenticated", False)
+
+    if not staff_auth and not patient_auth:
+        # Neither portal logged in — show the two-tab landing
+        st.markdown(
+            "<h2 style='text-align:center;color:#1a3c5e;'>🏥 Hospital Management System</h2>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<p style='text-align:center;color:#666;'>"
+            "AI-powered Diabetes · Hypertension · Kidney Disease management</p>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("---")
+
+        portal_tab, patient_tab = st.tabs(["🏥 Staff / Admin Portal", "👤 Patient Portal"])
+
+        with portal_tab:
+            st.info("Use the **sidebar** to log in as a staff member or administrator.")
+            login_section()
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown("### 🔐 Staff Login")
+                st.markdown("Use the sidebar →")
+                st.markdown("**Demo:** `admin` / `Admin123!`")
+                st.markdown("**Demo:** `doctor` / `Admin123!`")
+            with col2:
+                st.markdown("### 🚀 Staff Features")
+                st.markdown("""
+- Patient registration & management
+- AI Diabetes & Hypertension assessment
+- CKD / eGFR screening
+- Medication log & prescriptions
+- Appointment calendar
+- PDF report generation & email
+                """)
+            with col3:
+                st.markdown("### 📊 Clinical Parameters")
+                st.markdown("""
+- HbA1c, Urea, Creatinine
+- Lipid profile (Chol, TG, HDL, LDL, VLDL)
+- Blood pressure (SBP / DBP)
+- BMI, Glucose
+- Lifestyle & family history
+                """)
+
+        with patient_tab:
+            patient_portal_landing()
+
+        return
+
+    # ---- Staff portal ----
+    if staff_auth:
+        login_section()   # keeps sidebar logout + email config visible
+        st.sidebar.title("Navigation")
+        page = st.sidebar.radio(
+            "Go to",
+            ["Dashboard", "Patient Management", "AI Predictions",
+             "CKD Screening", "Medication Log", "Appointments"],
+        )
+        if page == "Dashboard":
+            main_dashboard()
+        elif page == "Patient Management":
+            patient_management()
+        elif page == "AI Predictions":
+            ai_predictions()
+        elif page == "CKD Screening":
+            ckd_screening_page()
+        elif page == "Medication Log":
+            medication_log_page()
+        elif page == "Appointments":
+            appointment_calendar_page()
+
+        st.sidebar.markdown("---")
+        st.sidebar.info(f"**Patients:** {len(hospital_data.patients)}")
+        st.sidebar.info(f"**Last Update:** {datetime.now().strftime('%H:%M')}")
+        return
+
+    # ---- Patient portal ----
+    if patient_auth:
+        patient_portal_app()
 
 
 if __name__ == "__main__":
