@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -11,6 +10,22 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 import io
+import smtplib
+import ssl
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+
+# ReportLab PDF generation
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+)
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 
 # Page configuration
 st.set_page_config(
@@ -49,6 +64,409 @@ ADMIN_USERS = {
         "name": "Head Doctor"
     }
 }
+
+# ==================== PDF REPORT GENERATOR ====================
+class PatientReportPDF:
+    """Generates a full clinical PDF report for a patient."""
+
+    def generate(self, patient: dict) -> bytes:
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=A4,
+            rightMargin=2 * cm,
+            leftMargin=2 * cm,
+            topMargin=2 * cm,
+            bottomMargin=2 * cm,
+        )
+
+        styles = getSampleStyleSheet()
+        W = A4[0] - 4 * cm  # usable width
+
+        # ---- Custom styles ----
+        title_style = ParagraphStyle(
+            "ReportTitle", parent=styles["Title"],
+            fontSize=20, textColor=colors.HexColor("#1a3c5e"),
+            spaceAfter=4, alignment=TA_CENTER
+        )
+        subtitle_style = ParagraphStyle(
+            "Subtitle", parent=styles["Normal"],
+            fontSize=10, textColor=colors.HexColor("#666666"),
+            alignment=TA_CENTER, spaceAfter=2
+        )
+        section_style = ParagraphStyle(
+            "Section", parent=styles["Heading2"],
+            fontSize=13, textColor=colors.white,
+            backColor=colors.HexColor("#1a3c5e"),
+            spaceAfter=6, spaceBefore=12,
+            leftIndent=-12, rightIndent=-12,
+            borderPad=6
+        )
+        field_label_style = ParagraphStyle(
+            "FieldLabel", parent=styles["Normal"],
+            fontSize=9, textColor=colors.HexColor("#555555")
+        )
+        field_value_style = ParagraphStyle(
+            "FieldValue", parent=styles["Normal"],
+            fontSize=10, textColor=colors.HexColor("#111111")
+        )
+        normal = styles["Normal"]
+        small = ParagraphStyle("Small", parent=normal, fontSize=8,
+                               textColor=colors.HexColor("#666666"))
+
+        da = patient.get("diabetes_assessment", {})
+        ha = patient.get("htn_assessment", {})
+
+        def section_header(title, color="#1a3c5e"):
+            return Table(
+                [[Paragraph(f"<b>{title}</b>",
+                            ParagraphStyle("SH", parent=styles["Normal"],
+                                           fontSize=11, textColor=colors.white))]],
+                colWidths=[W],
+                style=TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(color)),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                ])
+            )
+
+        def info_table(rows, col_ratio=(0.35, 0.65)):
+            col_widths = [W * r for r in col_ratio]
+            data = [
+                [Paragraph(f"<b>{k}</b>", field_label_style),
+                 Paragraph(str(v), field_value_style)]
+                for k, v in rows
+            ]
+            t = Table(data, colWidths=col_widths)
+            t.setStyle(TableStyle([
+                ("ROWBACKGROUNDS", (0, 0), (-1, -1),
+                 [colors.HexColor("#f5f8fc"), colors.white]),
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#dddddd")),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ]))
+            return t
+
+        def risk_badge_table(label, value, color):
+            data = [[
+                Paragraph(f"<b>{label}</b>",
+                           ParagraphStyle("BL", parent=normal, fontSize=9,
+                                          textColor=colors.HexColor("#555555"),
+                                          alignment=TA_CENTER)),
+                Paragraph(f"<b>{value}</b>",
+                           ParagraphStyle("BV", parent=normal, fontSize=12,
+                                          textColor=colors.white,
+                                          alignment=TA_CENTER))
+            ]]
+            t = Table(data, colWidths=[W * 0.4, W * 0.6])
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (1, 0), (1, 0), colors.HexColor(color)),
+                ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#ecf0f1")),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+            ]))
+            return t
+
+        def prob_table(labels_probs):
+            """Horizontal probability bar using nested table."""
+            rows = []
+            for label, prob in labels_probs:
+                pct = round(prob * 100, 1)
+                bar_filled = int(pct / 2)   # max ~50 chars
+                bar_empty = 50 - bar_filled
+                bar_color = "#2ecc71" if pct < 33 else "#e67e22" if pct < 66 else "#e74c3c"
+                rows.append([
+                    Paragraph(label, ParagraphStyle("PL", parent=normal, fontSize=9)),
+                    Paragraph(
+                        f"<font color='{bar_color}'>{'█' * bar_filled}</font>"
+                        f"<font color='#dddddd'>{'█' * bar_empty}</font>",
+                        ParagraphStyle("PB", parent=normal, fontSize=7)
+                    ),
+                    Paragraph(f"<b>{pct}%</b>",
+                               ParagraphStyle("PP", parent=normal, fontSize=9,
+                                              alignment=TA_RIGHT)),
+                ])
+            t = Table(rows, colWidths=[W * 0.28, W * 0.56, W * 0.16])
+            t.setStyle(TableStyle([
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("ROWBACKGROUNDS", (0, 0), (-1, -1),
+                 [colors.HexColor("#f9f9f9"), colors.white]),
+            ]))
+            return t
+
+        def bullet_list(items, bullet="•", color="#333333"):
+            paras = []
+            for item in items:
+                paras.append(Paragraph(
+                    f"<font color='{color}'>{bullet}</font>  {item}",
+                    ParagraphStyle("BulletItem", parent=normal, fontSize=9,
+                                   leftIndent=12, spaceAfter=3)
+                ))
+            return paras
+
+        # ---- Build story ----
+        story = []
+
+        # Header
+        story.append(Paragraph("🏥 Hospital Management System", title_style))
+        story.append(Paragraph("Patient Clinical Report", subtitle_style))
+        story.append(Paragraph(
+            f"Generated: {datetime.now().strftime('%d %B %Y, %H:%M')}  |  "
+            f"Report ID: RPT-{patient.get('patient_id', 'N/A')}",
+            subtitle_style
+        ))
+        story.append(HRFlowable(width=W, thickness=2,
+                                 color=colors.HexColor("#1a3c5e"), spaceAfter=10))
+
+        # ---- 1. Demographics ----
+        story.append(section_header("1. Patient Demographics"))
+        story.append(Spacer(1, 4))
+        story.append(info_table([
+            ("Patient ID", patient.get("patient_id", "N/A")),
+            ("Full Name", patient.get("name", "N/A")),
+            ("Age", f"{patient.get('age', 'N/A')} years"),
+            ("Gender", patient.get("gender", "N/A")),
+            ("Admission Date", patient.get("admission_date", "N/A")),
+            ("Admission Reason", patient.get("admission_reason", "N/A")),
+            ("Status", patient.get("status", "N/A")),
+        ]))
+
+        # ---- 2. Clinical Parameters ----
+        story.append(Spacer(1, 8))
+        story.append(section_header("2. Clinical Parameters", "#16537e"))
+        story.append(Spacer(1, 4))
+
+        # Two-column parameter table
+        params_left = [
+            ("HbA1c (mmol/mol)", f"{patient.get('HbA1c', 'N/A')}"),
+            ("Urea (mmol/L)", f"{patient.get('Urea', 'N/A')}"),
+            ("Creatinine / Cr (umol/L)", f"{patient.get('Cr', 'N/A')}"),
+            ("Cholesterol / Chol (mmol/L)", f"{patient.get('Chol', 'N/A')}"),
+            ("Triglycerides / TG (mmol/L)", f"{patient.get('TG', 'N/A')}"),
+            ("HDL Cholesterol (mmol/L)", f"{patient.get('HDL', 'N/A')}"),
+            ("LDL Cholesterol (mmol/L)", f"{patient.get('LDL', 'N/A')}"),
+            ("VLDL Cholesterol (mmol/L)", f"{patient.get('VLDL', 'N/A')}"),
+        ]
+        params_right = [
+            ("BMI (kg/m²)", f"{patient.get('BMI', 'N/A')}"),
+            ("Systolic BP / SBP (mmHg)", f"{patient.get('SBP', 'N/A')}"),
+            ("Diastolic BP / DBP (mmHg)", f"{patient.get('DBP', 'N/A')}"),
+            ("Fasting Glucose (mmol/L)", f"{patient.get('Glucose', 'N/A')}"),
+            ("Smoking", "Yes" if patient.get('Smoking') == 1 else "No"),
+            ("Physical Activity", "Active" if patient.get('PhysicalActivity') == 1 else "Sedentary"),
+            ("Family History of HTN", "Yes" if patient.get('FamilyHistory') == 1 else "No"),
+            ("Age", f"{patient.get('age', 'N/A')} years"),
+        ]
+
+        def two_col_params(left_rows, right_rows):
+            lbl = ParagraphStyle("PL", parent=normal, fontSize=8,
+                                  textColor=colors.HexColor("#666666"))
+            val = ParagraphStyle("PV", parent=normal, fontSize=9,
+                                  textColor=colors.HexColor("#111111"))
+            half = W / 2 - 0.5 * cm
+            left_data = [[Paragraph(f"<b>{k}</b>", lbl), Paragraph(str(v), val)]
+                          for k, v in left_rows]
+            right_data = [[Paragraph(f"<b>{k}</b>", lbl), Paragraph(str(v), val)]
+                           for k, v in right_rows]
+            # Zip into one wide table
+            combined = []
+            for i in range(max(len(left_data), len(right_data))):
+                lr = left_data[i] if i < len(left_data) else ["", ""]
+                rr = right_data[i] if i < len(right_data) else ["", ""]
+                combined.append(lr + [""] + rr)
+            t = Table(combined,
+                      colWidths=[half * 0.45, half * 0.55, 0.3 * cm,
+                                  half * 0.45, half * 0.55])
+            t.setStyle(TableStyle([
+                ("ROWBACKGROUNDS", (0, 0), (1, -1),
+                 [colors.HexColor("#f5f8fc"), colors.white]),
+                ("ROWBACKGROUNDS", (3, 0), (4, -1),
+                 [colors.HexColor("#f5f8fc"), colors.white]),
+                ("GRID", (0, 0), (1, -1), 0.3, colors.HexColor("#dddddd")),
+                ("GRID", (3, 0), (4, -1), 0.3, colors.HexColor("#dddddd")),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ]))
+            return t
+
+        story.append(two_col_params(params_left, params_right))
+
+        # ---- 3. Diabetes Assessment ----
+        story.append(Spacer(1, 10))
+        story.append(section_header("3. AI Diabetes Assessment", "#c0392b"))
+        story.append(Spacer(1, 6))
+
+        d_color = {"No Diabetes": "#27ae60", "Pre-Diabetes": "#e67e22", "Diabetes": "#c0392b"}.get(
+            da.get("condition", ""), "#555555")
+        r_color = {"Low": "#27ae60", "Medium": "#e67e22", "High": "#c0392b"}.get(
+            da.get("risk_category", ""), "#555555")
+
+        story.append(risk_badge_table("Diabetes Condition", da.get("condition", "N/A"), d_color))
+        story.append(Spacer(1, 4))
+        story.append(risk_badge_table("Risk Category", da.get("risk_category", "N/A"), r_color))
+        story.append(Spacer(1, 8))
+
+        story.append(Paragraph("<b>Probability Breakdown</b>",
+                                ParagraphStyle("PBH", parent=normal, fontSize=10,
+                                               textColor=colors.HexColor("#333333"))))
+        story.append(Spacer(1, 4))
+        story.append(prob_table([
+            ("No Diabetes", da.get("probability_no_diabetes", 0)),
+            ("Pre-Diabetes", da.get("probability_pre_diabetes", 0)),
+            ("Diabetes", da.get("probability_diabetes", 0)),
+        ]))
+        story.append(Spacer(1, 8))
+
+        if da.get("key_factors"):
+            story.append(Paragraph("<b>Key Risk Factors</b>",
+                                    ParagraphStyle("KF", parent=normal, fontSize=10)))
+            story.extend(bullet_list(da["key_factors"], color="#c0392b"))
+            story.append(Spacer(1, 4))
+
+        if da.get("recommendations"):
+            story.append(Paragraph("<b>Clinical Recommendations</b>",
+                                    ParagraphStyle("CR", parent=normal, fontSize=10)))
+            story.extend(bullet_list(da["recommendations"], color="#27ae60"))
+
+        # ---- 4. Hypertension Assessment ----
+        story.append(Spacer(1, 10))
+        story.append(section_header("4. AI Hypertension Assessment", "#2471a3"))
+        story.append(Spacer(1, 6))
+
+        htn_colors = {
+            "Normal": "#27ae60",
+            "Elevated": "#e67e22",
+            "Stage 1 Hypertension": "#e74c3c",
+            "Stage 2 Hypertension": "#8e44ad"
+        }
+        htn_risk_colors = {
+            "Low": "#27ae60", "Low-Medium": "#e67e22",
+            "Medium": "#e74c3c", "High": "#8e44ad"
+        }
+        h_color = htn_colors.get(ha.get("stage", ""), "#555555")
+        hr_color = htn_risk_colors.get(ha.get("risk_category", ""), "#555555")
+
+        story.append(risk_badge_table("HTN Stage", ha.get("stage", "N/A"), h_color))
+        story.append(Spacer(1, 4))
+        story.append(risk_badge_table("Risk Category", ha.get("risk_category", "N/A"), hr_color))
+        story.append(Spacer(1, 8))
+
+        story.append(Paragraph("<b>Probability Breakdown</b>",
+                                ParagraphStyle("PBHH", parent=normal, fontSize=10,
+                                               textColor=colors.HexColor("#333333"))))
+        story.append(Spacer(1, 4))
+        story.append(prob_table([
+            ("Normal", ha.get("prob_normal", 0)),
+            ("Elevated", ha.get("prob_elevated", 0)),
+            ("Stage 1 HTN", ha.get("prob_stage1", 0)),
+            ("Stage 2 HTN", ha.get("prob_stage2", 0)),
+        ]))
+        story.append(Spacer(1, 8))
+
+        if ha.get("key_factors"):
+            story.append(Paragraph("<b>Key Risk Factors</b>",
+                                    ParagraphStyle("KFH", parent=normal, fontSize=10)))
+            story.extend(bullet_list(ha["key_factors"], color="#2471a3"))
+            story.append(Spacer(1, 4))
+
+        if ha.get("recommendations"):
+            story.append(Paragraph("<b>Clinical Recommendations</b>",
+                                    ParagraphStyle("CRH", parent=normal, fontSize=10)))
+            story.extend(bullet_list(ha["recommendations"], color="#27ae60"))
+
+        # ---- Footer ----
+        story.append(Spacer(1, 16))
+        story.append(HRFlowable(width=W, thickness=1,
+                                 color=colors.HexColor("#cccccc"), spaceAfter=6))
+        story.append(Paragraph(
+            "⚠️  This report is generated by an AI-assisted system and is intended "
+            "to support — not replace — clinical judgment. All findings must be "
+            "reviewed and confirmed by a qualified healthcare professional.",
+            ParagraphStyle("Disclaimer", parent=normal, fontSize=7,
+                           textColor=colors.HexColor("#888888"), alignment=TA_CENTER)
+        ))
+
+        doc.build(story)
+        return buffer.getvalue()
+
+
+# ==================== EMAIL SENDER ====================
+class EmailSender:
+    """
+    Sends patient PDF reports via Gmail SMTP.
+    Configure SMTP credentials in Streamlit secrets or environment variables.
+    Secrets format (secrets.toml):
+        [email]
+        sender_address = "your_hospital@gmail.com"
+        sender_password = "your_app_password"   # Gmail App Password
+    """
+
+    def send_patient_report(
+        self,
+        recipient_email: str,
+        patient_name: str,
+        patient_id: str,
+        pdf_bytes: bytes,
+        sender_email: str,
+        sender_password: str,
+    ) -> tuple[bool, str]:
+        try:
+            msg = MIMEMultipart("mixed")
+            msg["From"] = sender_email
+            msg["To"] = recipient_email
+            msg["Subject"] = f"Patient Clinical Report — {patient_name} ({patient_id})"
+
+            body = f"""Dear {patient_name},
+
+Please find attached your clinical assessment report from the Hospital Management System.
+
+This report contains:
+  • Your demographic information
+  • Full clinical parameters
+  • AI-powered Diabetes risk assessment
+  • AI-powered Hypertension risk assessment
+  • Personalised clinical recommendations
+
+⚠️  Important: This report is AI-assisted and should be reviewed with your healthcare provider.
+
+If you have any questions about this report, please contact your treating physician.
+
+Kind regards,
+Hospital Management System
+"""
+            msg.attach(MIMEText(body, "plain"))
+
+            # Attach PDF
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(pdf_bytes)
+            encoders.encode_base64(part)
+            filename = f"Patient_Report_{patient_id}_{datetime.now().strftime('%Y%m%d')}.pdf"
+            part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+            msg.attach(part)
+
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+                server.login(sender_email, sender_password)
+                server.sendmail(sender_email, recipient_email, msg.as_string())
+
+            return True, f"Report sent successfully to {recipient_email}"
+        except smtplib.SMTPAuthenticationError:
+            return False, "SMTP authentication failed. Check your Gmail App Password."
+        except smtplib.SMTPException as e:
+            return False, f"SMTP error: {str(e)}"
+        except Exception as e:
+            return False, f"Unexpected error: {str(e)}"
+
+
+report_generator = PatientReportPDF()
+email_sender = EmailSender()
 
 # ==================== DIABETES AI ENGINE ====================
 class DiabetesAI:
@@ -507,6 +925,34 @@ def login_section():
                 del st.session_state[key]
             st.rerun()
 
+        # ---- Email / SMTP Configuration ----
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### 📧 Email Configuration")
+        st.sidebar.caption(
+            "Enter Gmail credentials to enable automatic PDF report emails on patient registration. "
+            "Use a [Gmail App Password](https://myaccount.google.com/apppasswords), not your regular password."
+        )
+        smtp_email = st.sidebar.text_input(
+            "Sender Gmail Address",
+            value=st.session_state.get("smtp_email", ""),
+            placeholder="hospital@gmail.com",
+        )
+        smtp_password = st.sidebar.text_input(
+            "Gmail App Password",
+            type="password",
+            value=st.session_state.get("smtp_password", ""),
+            placeholder="xxxx xxxx xxxx xxxx",
+        )
+        if st.sidebar.button("💾 Save Email Config"):
+            st.session_state.smtp_email = smtp_email
+            st.session_state.smtp_password = smtp_password
+            st.sidebar.success("✅ Email config saved for this session!")
+
+        if st.session_state.get("smtp_email") and st.session_state.get("smtp_password"):
+            st.sidebar.success("📧 Email sending: **Enabled**")
+        else:
+            st.sidebar.warning("📧 Email sending: **Disabled** (no credentials saved)")
+
 
 def main_dashboard():
     st.title("🏥 Hospital Management System")
@@ -609,6 +1055,8 @@ def patient_management():
                 name = st.text_input("Full Name *")
                 age = st.number_input("Age *", min_value=0, max_value=120, value=45)
                 gender = st.selectbox("Gender *", ["Male", "Female", "Other"])
+                patient_email = st.text_input("Patient Email *", placeholder="patient@example.com",
+                                               help="PDF report will be sent here on registration")
                 admission_reason = st.selectbox("Admission Reason *",
                     ["Routine Diabetes Screening", "Diabetes Management",
                      "Pre-diabetes Consultation", "Hypertension Monitoring",
@@ -652,6 +1100,7 @@ def patient_management():
                 if name and age:
                     patient_data = {
                         'name': name, 'age': age, 'gender': gender,
+                        'email': patient_email,
                         'Urea': urea, 'Cr': cr, 'HbA1c': hba1c,
                         'Chol': chol, 'TG': tg, 'HDL': hdl, 'LDL': ldl, 'VLDL': vldl,
                         'BMI': bmi,
@@ -693,6 +1142,54 @@ def patient_management():
                     if ha['key_factors']:
                         st.warning(f"🚨 HTN Risk Factors: {', '.join(ha['key_factors'])}")
                     st.info("💡 HTN Recommendations: " + " | ".join(ha['recommendations']))
+
+                    st.markdown("---")
+
+                    # ---- PDF Generation + Email ----
+                    st.subheader("📄 Patient Report")
+                    with st.spinner("Generating PDF report..."):
+                        try:
+                            pdf_bytes = report_generator.generate(patient_data)
+                            st.success("✅ PDF report generated successfully!")
+
+                            # Always offer download
+                            st.download_button(
+                                label="⬇️ Download PDF Report",
+                                data=pdf_bytes,
+                                file_name=f"Patient_Report_{patient_id}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                                mime="application/pdf",
+                                help="Download the full clinical PDF report"
+                            )
+
+                            # Email if configured and patient email provided
+                            smtp_email = st.session_state.get("smtp_email", "")
+                            smtp_password = st.session_state.get("smtp_password", "")
+
+                            if smtp_email and smtp_password and patient_email:
+                                with st.spinner(f"Sending report to {patient_email}..."):
+                                    success, message = email_sender.send_patient_report(
+                                        recipient_email=patient_email,
+                                        patient_name=name,
+                                        patient_id=patient_id,
+                                        pdf_bytes=pdf_bytes,
+                                        sender_email=smtp_email,
+                                        sender_password=smtp_password,
+                                    )
+                                if success:
+                                    st.success(f"📧 {message}")
+                                else:
+                                    st.error(f"📧 Email failed: {message}")
+                                    st.info("💡 You can still download the PDF using the button above.")
+                            elif not patient_email:
+                                st.info("ℹ️ No patient email provided — PDF available for download only.")
+                            else:
+                                st.warning(
+                                    "⚠️ Email credentials not configured. "
+                                    "Configure them in the sidebar to enable automatic emailing. "
+                                    "PDF is available for download above."
+                                )
+                        except Exception as e:
+                            st.error(f"PDF generation error: {str(e)}")
                 else:
                     st.error("Please fill in all required fields.")
 
