@@ -1,7 +1,7 @@
 streamlit
+scikit-learn
 pandas
 numpy
-plotly
-xlrd
-joblib
-scikit-learn
+cryptography
+PyPDF2
+reportlab
