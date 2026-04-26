@@ -1,7 +1,10 @@
 streamlit
-scikit-learn
 pandas
 numpy
+scikit-learn
+plotly
 cryptography
 PyPDF2
 reportlab
+gspread
+oauth2client
