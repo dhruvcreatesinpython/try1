@@ -885,10 +885,326 @@ class HospitalData:
         }
 
 
+# ==================== CKD / eGFR ENGINE ====================
+class CKDScreener:
+    """
+    Calculates eGFR using the CKD-EPI 2021 creatinine equation (race-free).
+    Stages kidney disease per KDIGO 2022 guidelines.
+
+    Input creatinine is expected in umol/L (as stored in patient records as 'Cr').
+    """
+
+    CKD_STAGES = {
+        1: {"label": "G1 — Normal or High",      "egfr": "≥ 90",    "color": "#27ae60", "action": "Monitor annually; manage risk factors"},
+        2: {"label": "G2 — Mildly Decreased",    "egfr": "60–89",   "color": "#2ecc71", "action": "Monitor every 6–12 months; blood pressure control"},
+        3: {"label": "G3a — Mildly-Moderately",  "egfr": "45–59",   "color": "#f39c12", "action": "Nephrology referral; avoid nephrotoxins; dietary review"},
+        4: {"label": "G3b — Moderately-Severely","egfr": "30–44",   "color": "#e67e22", "action": "Nephrology referral urgently; prepare for RRT discussion"},
+        5: {"label": "G4 — Severely Decreased",  "egfr": "15–29",   "color": "#e74c3c", "action": "Urgent nephrology; renal replacement therapy planning"},
+        6: {"label": "G5 — Kidney Failure",      "egfr": "< 15",    "color": "#8e44ad", "action": "Immediate specialist care; dialysis or transplant evaluation"},
+    }
+
+    def calculate(self, creatinine_umol: float, age: int, gender: str) -> dict:
+        """CKD-EPI 2021 (race-free). Returns eGFR and CKD staging."""
+        try:
+            # Convert umol/L → mg/dL
+            cr_mgdl = creatinine_umol / 88.42
+            is_female = gender.lower() in ("female", "f")
+
+            kappa = 0.7 if is_female else 0.9
+            alpha = -0.241 if is_female else -0.302
+            sex_factor = 1.012 if is_female else 1.0
+
+            ratio = cr_mgdl / kappa
+            if ratio < 1:
+                egfr = 142 * (ratio ** alpha) * (0.9938 ** age) * sex_factor
+            else:
+                egfr = 142 * (ratio ** -1.200) * (0.9938 ** age) * sex_factor
+
+            egfr = round(egfr, 1)
+
+            # KDIGO staging
+            if egfr >= 90:
+                stage_key = 1
+            elif egfr >= 60:
+                stage_key = 2
+            elif egfr >= 45:
+                stage_key = 3
+            elif egfr >= 30:
+                stage_key = 4
+            elif egfr >= 15:
+                stage_key = 5
+            else:
+                stage_key = 6
+
+            stage = self.CKD_STAGES[stage_key]
+
+            # Albuminuria risk modifier (estimated from urea/glucose if available)
+            flags = []
+            if egfr < 60:
+                flags.append("eGFR below 60 — CKD confirmed, nephrology referral indicated")
+            if egfr < 30:
+                flags.append("Severely impaired kidney function — urgent specialist review")
+
+            recommendations = self._recommendations(stage_key, egfr)
+
+            return {
+                "egfr": egfr,
+                "stage_key": stage_key,
+                "stage_label": stage["label"],
+                "egfr_range": stage["egfr"],
+                "color": stage["color"],
+                "action": stage["action"],
+                "recommendations": recommendations,
+                "flags": flags,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _recommendations(self, stage: int, egfr: float) -> list:
+        base = [
+            "Stay well hydrated (unless fluid restricted)",
+            "Avoid NSAIDs (ibuprofen, naproxen) — nephrotoxic",
+            "Monitor BP closely — target < 130/80 mmHg",
+            "Annual urine albumin-to-creatinine ratio (ACR) test",
+        ]
+        if stage >= 3:
+            base += [
+                "Low-protein diet (0.6–0.8 g/kg/day) — consult dietitian",
+                "Adjust medication doses for reduced GFR",
+                "Refer to nephrology for specialist management",
+            ]
+        if stage >= 4:
+            base += [
+                "Discuss renal replacement therapy options (dialysis / transplant)",
+                "Avoid contrast agents unless essential — risk of AKI",
+                "Erythropoietin assessment for anaemia of CKD",
+            ]
+        if stage >= 5:
+            base.insert(0, "⚠️  URGENT: Immediate nephrology referral required")
+        return base
+
+
+# ==================== MEDICATION LOG ====================
+class MedicationLog:
+    """
+    In-memory store for patient prescriptions.
+    Each record: { med_id, patient_id, drug_name, dose, frequency,
+                   route, prescriber, start_date, end_date,
+                   indication, adherence, notes, active }
+    """
+    COMMON_DRUGS = {
+        "Diabetes": [
+            "Metformin", "Glibenclamide", "Glipizide", "Sitagliptin",
+            "Empagliflozin", "Dapagliflozin", "Liraglutide", "Insulin (Basal)",
+            "Insulin (Bolus)", "Pioglitazone",
+        ],
+        "Hypertension": [
+            "Amlodipine", "Lisinopril", "Losartan", "Atenolol",
+            "Hydrochlorothiazide", "Ramipril", "Valsartan", "Bisoprolol",
+            "Nifedipine", "Spironolactone",
+        ],
+        "CKD / Renal": [
+            "Furosemide", "Sodium Bicarbonate", "Calcium Carbonate",
+            "Erythropoietin", "Ferrous Sulphate", "Alfacalcidol",
+        ],
+        "Lipids": [
+            "Atorvastatin", "Rosuvastatin", "Fenofibrate", "Ezetimibe",
+        ],
+        "Other": ["Other (type below)"],
+    }
+    FREQUENCIES = [
+        "Once daily (OD)", "Twice daily (BD)", "Three times daily (TDS)",
+        "Four times daily (QDS)", "Every 8 hours", "Every 12 hours",
+        "Weekly", "As needed (PRN)", "Other",
+    ]
+    ROUTES = ["Oral", "Subcutaneous", "Intravenous", "Intramuscular",
+              "Topical", "Inhaled", "Sublingual"]
+    ADHERENCE = ["Good (>80%)", "Moderate (50–80%)", "Poor (<50%)", "Unknown"]
+
+    def __init__(self):
+        self.records = []
+        self._seed_sample_data()
+
+    def _seed_sample_data(self):
+        seeds = [
+            {
+                "patient_id": "PAT0001", "drug_name": "Metformin",
+                "dose": "500 mg", "frequency": "Twice daily (BD)", "route": "Oral",
+                "prescriber": "Head Doctor", "start_date": "2024-01-10",
+                "end_date": "", "indication": "Diabetes prevention",
+                "adherence": "Good (>80%)", "notes": "Take with meals", "active": True,
+            },
+            {
+                "patient_id": "PAT0002", "drug_name": "Metformin",
+                "dose": "1000 mg", "frequency": "Twice daily (BD)", "route": "Oral",
+                "prescriber": "Head Doctor", "start_date": "2024-01-12",
+                "end_date": "", "indication": "Type 2 Diabetes",
+                "adherence": "Moderate (50–80%)", "notes": "", "active": True,
+            },
+            {
+                "patient_id": "PAT0002", "drug_name": "Amlodipine",
+                "dose": "5 mg", "frequency": "Once daily (OD)", "route": "Oral",
+                "prescriber": "Head Doctor", "start_date": "2024-01-12",
+                "end_date": "", "indication": "Stage 2 Hypertension",
+                "adherence": "Good (>80%)", "notes": "Check ankle oedema", "active": True,
+            },
+            {
+                "patient_id": "PAT0003", "drug_name": "Losartan",
+                "dose": "50 mg", "frequency": "Once daily (OD)", "route": "Oral",
+                "prescriber": "Head Doctor", "start_date": "2024-01-15",
+                "end_date": "", "indication": "Stage 1 Hypertension",
+                "adherence": "Good (>80%)", "notes": "Monitor potassium", "active": True,
+            },
+            {
+                "patient_id": "PAT0003", "drug_name": "Atorvastatin",
+                "dose": "20 mg", "frequency": "Once daily (OD)", "route": "Oral",
+                "prescriber": "Head Doctor", "start_date": "2024-01-15",
+                "end_date": "", "indication": "Dyslipidaemia",
+                "adherence": "Good (>80%)", "notes": "Take at night", "active": True,
+            },
+        ]
+        for i, s in enumerate(seeds):
+            s["med_id"] = f"MED{i+1:04d}"
+        self.records = seeds
+
+    def add(self, record: dict) -> str:
+        med_id = f"MED{len(self.records)+1:04d}"
+        record["med_id"] = med_id
+        record["prescribed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.records.append(record)
+        return med_id
+
+    def for_patient(self, patient_id: str) -> list:
+        return [r for r in self.records if r["patient_id"] == patient_id]
+
+    def discontinue(self, med_id: str):
+        for r in self.records:
+            if r["med_id"] == med_id:
+                r["active"] = False
+                r["end_date"] = datetime.now().strftime("%Y-%m-%d")
+
+    def active_count(self, patient_id: str) -> int:
+        return sum(1 for r in self.records
+                   if r["patient_id"] == patient_id and r.get("active"))
+
+
+# ==================== APPOINTMENT CALENDAR ====================
+class AppointmentCalendar:
+    """
+    In-memory appointment store.
+    Each record: { appt_id, patient_id, patient_name, doctor,
+                   date, time, duration_mins, type, notes, status }
+    """
+    DOCTORS = ["Head Doctor", "System Administrator", "Dr. Ananya Sharma",
+               "Dr. James Okafor", "Dr. Priya Mehta"]
+    APPT_TYPES = [
+        "Diabetes Follow-up", "Hypertension Review", "CKD Monitoring",
+        "General Consultation", "Medication Review", "Lab Results Review",
+        "New Patient Assessment", "Post-Discharge Review",
+    ]
+    STATUSES = ["Scheduled", "Completed", "Cancelled", "No Show"]
+    DURATIONS = [15, 20, 30, 45, 60]
+
+    def __init__(self):
+        self.appointments = []
+        self._seed_sample_data()
+
+    def _seed_sample_data(self):
+        today = datetime.now().date()
+        seeds = [
+            {
+                "patient_id": "PAT0001", "patient_name": "John Smith",
+                "doctor": "Head Doctor", "date": str(today),
+                "time": "09:00", "duration_mins": 30,
+                "type": "Diabetes Follow-up", "notes": "Review HbA1c trends",
+                "status": "Scheduled",
+            },
+            {
+                "patient_id": "PAT0002", "patient_name": "Jane Doe",
+                "doctor": "Head Doctor", "date": str(today),
+                "time": "10:00", "duration_mins": 45,
+                "type": "Hypertension Review", "notes": "BP has been elevated",
+                "status": "Scheduled",
+            },
+            {
+                "patient_id": "PAT0003", "patient_name": "Robert Chang",
+                "doctor": "Dr. Ananya Sharma",
+                "date": str(today + timedelta(days=1)),
+                "time": "11:30", "duration_mins": 30,
+                "type": "CKD Monitoring", "notes": "Check creatinine trend",
+                "status": "Scheduled",
+            },
+            {
+                "patient_id": "PAT0001", "patient_name": "John Smith",
+                "doctor": "Dr. Priya Mehta",
+                "date": str(today + timedelta(days=3)),
+                "time": "14:00", "duration_mins": 20,
+                "type": "Medication Review", "notes": "",
+                "status": "Scheduled",
+            },
+            {
+                "patient_id": "PAT0002", "patient_name": "Jane Doe",
+                "doctor": "Head Doctor",
+                "date": str(today - timedelta(days=2)),
+                "time": "09:30", "duration_mins": 30,
+                "type": "Lab Results Review", "notes": "Discussed kidney function",
+                "status": "Completed",
+            },
+        ]
+        for i, s in enumerate(seeds):
+            s["appt_id"] = f"APPT{i+1:04d}"
+        self.appointments = seeds
+
+    def add(self, record: dict) -> str:
+        appt_id = f"APPT{len(self.appointments)+1:04d}"
+        record["appt_id"] = appt_id
+        self.appointments.append(record)
+        return appt_id
+
+    def for_date(self, date_str: str) -> list:
+        return sorted(
+            [a for a in self.appointments if a["date"] == date_str],
+            key=lambda x: x["time"]
+        )
+
+    def for_patient(self, patient_id: str) -> list:
+        return sorted(
+            [a for a in self.appointments if a["patient_id"] == patient_id],
+            key=lambda x: (x["date"], x["time"])
+        )
+
+    def for_doctor(self, doctor: str) -> list:
+        return sorted(
+            [a for a in self.appointments if a["doctor"] == doctor],
+            key=lambda x: (x["date"], x["time"])
+        )
+
+    def update_status(self, appt_id: str, status: str):
+        for a in self.appointments:
+            if a["appt_id"] == appt_id:
+                a["status"] = status
+
+    def week_range(self, start_date) -> list:
+        """Return appointments for a 7-day window starting at start_date."""
+        days = [str(start_date + timedelta(days=i)) for i in range(7)]
+        return [a for a in self.appointments if a["date"] in days]
+
+    def today_count(self) -> int:
+        return len(self.for_date(str(datetime.now().date())))
+
+    def upcoming_count(self) -> int:
+        today = str(datetime.now().date())
+        return sum(1 for a in self.appointments
+                   if a["date"] >= today and a["status"] == "Scheduled")
+
+
 # ---- Initialize AI models BEFORE HospitalData ----
 diabetes_ai = DiabetesAI()
 hypertension_ai = HypertensionAI()
 hospital_data = HospitalData()
+ckd_screener = CKDScreener()
+medication_log = MedicationLog()
+appointment_calendar = AppointmentCalendar()
 
 
 # ==================== STREAMLIT PAGES ====================
@@ -1406,6 +1722,649 @@ def ai_predictions():
                     st.warning("🚨 Key Risk Factors:\n" + "\n".join(f"- {f}" for f in result['key_factors']))
             with c2:
                 st.info("💡 Recommendations:\n" + "\n".join(f"- {r}" for r in result['recommendations']))
+
+
+# ==================== CKD SCREENING PAGE ====================
+def ckd_screening_page():
+    st.title("🫘 Kidney Disease (CKD) Screening")
+    st.info(
+        "eGFR calculated using the **CKD-EPI 2021 creatinine equation** (race-free). "
+        "Staging follows **KDIGO 2022** guidelines. "
+        "Results are based on a single creatinine reading — confirm with repeat testing."
+    )
+
+    tab1, tab2 = st.tabs(["📋 Screen Registered Patients", "🔬 Manual eGFR Calculator"])
+
+    # ---- Tab 1: Screen all registered patients ----
+    with tab1:
+        st.subheader("CKD Risk Across All Patients")
+
+        if not hospital_data.patients:
+            st.info("No patients registered yet.")
+        else:
+            results = []
+            for p in hospital_data.patients:
+                ckd = ckd_screener.calculate(
+                    creatinine_umol=p.get("Cr", 70),
+                    age=p.get("age", 50),
+                    gender=p.get("gender", "Male"),
+                )
+                results.append({
+                    "ID": p["patient_id"],
+                    "Name": p["name"],
+                    "Age": p["age"],
+                    "Gender": p["gender"],
+                    "Creatinine (umol/L)": p.get("Cr", "N/A"),
+                    "eGFR (mL/min/1.73m²)": ckd.get("egfr", "Error"),
+                    "CKD Stage": ckd.get("stage_label", "Error"),
+                    "eGFR Range": ckd.get("egfr_range", ""),
+                    "Recommended Action": ckd.get("action", ""),
+                })
+
+            df = pd.DataFrame(results)
+            st.dataframe(df, use_container_width=True)
+
+            # Stage distribution chart
+            col1, col2 = st.columns(2)
+            with col1:
+                stage_counts = df["CKD Stage"].value_counts().reset_index()
+                stage_counts.columns = ["Stage", "Count"]
+                fig = px.pie(stage_counts, values="Count", names="Stage",
+                             title="CKD Stage Distribution",
+                             color_discrete_sequence=[
+                                 "#27ae60", "#2ecc71", "#f39c12",
+                                 "#e67e22", "#e74c3c", "#8e44ad"])
+                st.plotly_chart(fig, use_container_width=True)
+
+            with col2:
+                fig2 = px.bar(df, x="Name", y="eGFR (mL/min/1.73m²)",
+                              color="CKD Stage", title="eGFR by Patient",
+                              color_discrete_sequence=[
+                                  "#27ae60", "#f39c12", "#e74c3c", "#8e44ad"])
+                fig2.add_hline(y=60, line_dash="dash", line_color="orange",
+                               annotation_text="CKD threshold (60)")
+                fig2.add_hline(y=30, line_dash="dash", line_color="red",
+                               annotation_text="Severe CKD (30)")
+                st.plotly_chart(fig2, use_container_width=True)
+
+            # Flag high-risk patients
+            at_risk = df[df["eGFR (mL/min/1.73m²)"].apply(
+                lambda x: isinstance(x, float) and x < 60)]
+            if not at_risk.empty:
+                st.error(f"⚠️  {len(at_risk)} patient(s) have eGFR < 60 — CKD confirmed:")
+                for _, row in at_risk.iterrows():
+                    st.warning(
+                        f"🔴 **{row['Name']}** ({row['ID']}) — "
+                        f"eGFR: {row['eGFR (mL/min/1.73m²)']} | "
+                        f"Stage: {row['CKD Stage']}"
+                    )
+            else:
+                st.success("✅ All patients have eGFR ≥ 60 — no CKD confirmed at this time.")
+
+            # Detailed view per patient
+            st.markdown("---")
+            st.subheader("🔍 Detailed Patient CKD Report")
+            selected_name = st.selectbox(
+                "Select patient for detailed report",
+                [p["name"] for p in hospital_data.patients]
+            )
+            selected = next(p for p in hospital_data.patients if p["name"] == selected_name)
+            ckd_detail = ckd_screener.calculate(
+                creatinine_umol=selected.get("Cr", 70),
+                age=selected.get("age", 50),
+                gender=selected.get("gender", "Male"),
+            )
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("eGFR", f"{ckd_detail.get('egfr', 'N/A')} mL/min/1.73m²")
+            c2.metric("CKD Stage", ckd_detail.get("stage_label", "N/A"))
+            c3.metric("Normal Range", ckd_detail.get("egfr_range", "N/A"))
+
+            # eGFR gauge
+            egfr_val = ckd_detail.get("egfr", 0)
+            fig_g = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=egfr_val,
+                title={"text": "eGFR (mL/min/1.73m²)"},
+                gauge={
+                    "axis": {"range": [0, 120]},
+                    "bar": {"color": ckd_detail.get("color", "#555")},
+                    "steps": [
+                        {"range": [0, 15],  "color": "#8e44ad"},
+                        {"range": [15, 30], "color": "#e74c3c"},
+                        {"range": [30, 45], "color": "#e67e22"},
+                        {"range": [45, 60], "color": "#f39c12"},
+                        {"range": [60, 90], "color": "#2ecc71"},
+                        {"range": [90, 120],"color": "#27ae60"},
+                    ],
+                    "threshold": {
+                        "line": {"color": "black", "width": 4},
+                        "thickness": 0.75, "value": 60
+                    }
+                }
+            ))
+            fig_g.update_layout(height=280, margin=dict(t=20, b=0))
+            st.plotly_chart(fig_g, use_container_width=True)
+
+            if ckd_detail.get("flags"):
+                for flag in ckd_detail["flags"]:
+                    st.error(f"🚨 {flag}")
+
+            st.markdown("**Clinical Recommendations:**")
+            for rec in ckd_detail.get("recommendations", []):
+                st.write(f"- {rec}")
+
+    # ---- Tab 2: Manual calculator ----
+    with tab2:
+        st.subheader("🔬 Manual eGFR Calculator")
+        st.caption("Use this for quick one-off calculations without registering a patient.")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            m_cr = st.number_input("Serum Creatinine (umol/L)", 20.0, 1200.0, 85.0, 1.0)
+        with col2:
+            m_age = st.number_input("Age (years)", 18, 110, 50)
+        with col3:
+            m_gender = st.selectbox("Gender", ["Male", "Female"])
+
+        if st.button("Calculate eGFR"):
+            res = ckd_screener.calculate(m_cr, m_age, m_gender)
+            c1, c2 = st.columns(2)
+            c1.metric("eGFR", f"{res.get('egfr', 'Error')} mL/min/1.73m²")
+            c2.metric("CKD Stage", res.get("stage_label", "Error"))
+            st.info(f"📋 Recommended Action: {res.get('action', '')}")
+            if res.get("flags"):
+                for f in res["flags"]:
+                    st.error(f"🚨 {f}")
+            st.markdown("**Recommendations:**")
+            for r in res.get("recommendations", []):
+                st.write(f"- {r}")
+
+
+# ==================== MEDICATION LOG PAGE ====================
+def medication_log_page():
+    st.title("💊 Medication Log")
+
+    tab1, tab2, tab3 = st.tabs([
+        "➕ Add Prescription", "📋 View by Patient", "📊 Medication Overview"
+    ])
+
+    # ---- Tab 1: Add prescription ----
+    with tab1:
+        st.subheader("Prescribe Medication")
+
+        if not hospital_data.patients:
+            st.info("No patients registered yet.")
+        else:
+            patient_options = {
+                f"{p['name']} ({p['patient_id']})": p["patient_id"]
+                for p in hospital_data.patients
+            }
+            selected_label = st.selectbox("Select Patient *", list(patient_options.keys()))
+            selected_pid = patient_options[selected_label]
+
+            with st.form("med_form"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    category = st.selectbox("Drug Category *",
+                                            list(MedicationLog.COMMON_DRUGS.keys()))
+                    drug_options = MedicationLog.COMMON_DRUGS[category]
+                    drug_name_select = st.selectbox("Drug Name *", drug_options)
+                    custom_drug = ""
+                    if drug_name_select == "Other (type below)":
+                        custom_drug = st.text_input("Custom Drug Name *")
+                    drug_name = custom_drug if custom_drug else drug_name_select
+
+                    dose = st.text_input("Dose *", placeholder="e.g. 500 mg, 10 units")
+                    frequency = st.selectbox("Frequency *", MedicationLog.FREQUENCIES)
+                    route = st.selectbox("Route *", MedicationLog.ROUTES)
+
+                with col2:
+                    prescriber = st.selectbox("Prescriber *", AppointmentCalendar.DOCTORS)
+                    start_date = st.date_input("Start Date *", value=datetime.now().date())
+                    end_date = st.date_input("End Date (leave today if ongoing)",
+                                             value=datetime.now().date())
+                    ongoing = st.checkbox("Ongoing (no fixed end date)", value=True)
+                    indication = st.text_input("Indication *",
+                                               placeholder="e.g. Type 2 Diabetes")
+                    adherence = st.selectbox("Adherence", MedicationLog.ADHERENCE)
+                    notes = st.text_area("Clinical Notes", height=80,
+                                         placeholder="Side effects, monitoring required, etc.")
+
+                if st.form_submit_button("💾 Add Prescription"):
+                    if drug_name and dose and indication:
+                        record = {
+                            "patient_id": selected_pid,
+                            "drug_name": drug_name,
+                            "dose": dose,
+                            "frequency": frequency,
+                            "route": route,
+                            "prescriber": prescriber,
+                            "start_date": str(start_date),
+                            "end_date": "" if ongoing else str(end_date),
+                            "indication": indication,
+                            "adherence": adherence,
+                            "notes": notes,
+                            "active": True,
+                        }
+                        med_id = medication_log.add(record)
+                        st.success(
+                            f"✅ Prescription **{drug_name} {dose}** added! "
+                            f"ID: **{med_id}**"
+                        )
+                    else:
+                        st.error("Please fill in Drug Name, Dose, and Indication.")
+
+    # ---- Tab 2: View by patient ----
+    with tab2:
+        st.subheader("Patient Medication History")
+
+        if not hospital_data.patients:
+            st.info("No patients registered yet.")
+        else:
+            patient_options = {
+                f"{p['name']} ({p['patient_id']})": p["patient_id"]
+                for p in hospital_data.patients
+            }
+            sel_label = st.selectbox("Select Patient",
+                                     list(patient_options.keys()), key="view_pt")
+            sel_pid = patient_options[sel_label]
+
+            meds = medication_log.for_patient(sel_pid)
+            active_meds = [m for m in meds if m.get("active")]
+            inactive_meds = [m for m in meds if not m.get("active")]
+
+            col1, col2 = st.columns(2)
+            col1.metric("Active Prescriptions", len(active_meds))
+            col2.metric("Discontinued", len(inactive_meds))
+
+            if active_meds:
+                st.markdown("#### ✅ Active Prescriptions")
+                for m in active_meds:
+                    adherence_color = {
+                        "Good (>80%)": "🟢",
+                        "Moderate (50–80%)": "🟡",
+                        "Poor (<50%)": "🔴",
+                        "Unknown": "⚪"
+                    }.get(m.get("adherence", "Unknown"), "⚪")
+
+                    with st.expander(
+                        f"{adherence_color} **{m['drug_name']}** {m['dose']} — "
+                        f"{m['frequency']} | Since: {m['start_date']} | ID: {m['med_id']}"
+                    ):
+                        c1, c2, c3 = st.columns(3)
+                        c1.write(f"**Route:** {m['route']}")
+                        c1.write(f"**Prescriber:** {m['prescriber']}")
+                        c2.write(f"**Indication:** {m['indication']}")
+                        c2.write(f"**Adherence:** {m.get('adherence', 'Unknown')}")
+                        c3.write(f"**End Date:** {m['end_date'] or 'Ongoing'}")
+                        if m.get("notes"):
+                            st.info(f"📝 Notes: {m['notes']}")
+                        if st.button(f"🚫 Discontinue {m['med_id']}", key=f"dc_{m['med_id']}"):
+                            medication_log.discontinue(m["med_id"])
+                            st.warning(f"Discontinued {m['drug_name']}.")
+                            st.rerun()
+            else:
+                st.info("No active prescriptions for this patient.")
+
+            if inactive_meds:
+                st.markdown("#### 🗂️ Discontinued Medications")
+                disc_df = pd.DataFrame([{
+                    "Drug": m["drug_name"],
+                    "Dose": m["dose"],
+                    "Frequency": m["frequency"],
+                    "Indication": m["indication"],
+                    "Started": m["start_date"],
+                    "Ended": m["end_date"],
+                    "Prescriber": m["prescriber"],
+                } for m in inactive_meds])
+                st.dataframe(disc_df, use_container_width=True)
+
+    # ---- Tab 3: Overview ----
+    with tab3:
+        st.subheader("📊 Medication Overview")
+
+        all_meds = medication_log.records
+        if not all_meds:
+            st.info("No medications recorded yet.")
+        else:
+            active_all = [m for m in all_meds if m.get("active")]
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Prescriptions", len(all_meds))
+            c2.metric("Active", len(active_all))
+            c3.metric("Discontinued", len(all_meds) - len(active_all))
+
+            col1, col2 = st.columns(2)
+            with col1:
+                drug_counts = pd.Series([m["drug_name"] for m in active_all]).value_counts()
+                fig = px.bar(x=drug_counts.index, y=drug_counts.values,
+                             title="Most Prescribed Drugs (Active)",
+                             labels={"x": "Drug", "y": "Prescriptions"},
+                             color_discrete_sequence=["#3498db"])
+                fig.update_layout(xaxis_tickangle=-30)
+                st.plotly_chart(fig, use_container_width=True)
+
+            with col2:
+                adh_counts = pd.Series(
+                    [m.get("adherence", "Unknown") for m in active_all]
+                ).value_counts()
+                fig2 = px.pie(values=adh_counts.values, names=adh_counts.index,
+                              title="Adherence Distribution (Active Prescriptions)",
+                              color_discrete_sequence=["#27ae60", "#f39c12",
+                                                        "#e74c3c", "#95a5a6"])
+                st.plotly_chart(fig2, use_container_width=True)
+
+            # Full table
+            st.markdown("#### All Active Prescriptions")
+            df_all = pd.DataFrame([{
+                "Med ID": m["med_id"],
+                "Patient ID": m["patient_id"],
+                "Drug": m["drug_name"],
+                "Dose": m["dose"],
+                "Frequency": m["frequency"],
+                "Route": m["route"],
+                "Indication": m["indication"],
+                "Adherence": m.get("adherence", "Unknown"),
+                "Started": m["start_date"],
+                "Prescriber": m["prescriber"],
+            } for m in active_all])
+            st.dataframe(df_all, use_container_width=True)
+
+
+# ==================== APPOINTMENT CALENDAR PAGE ====================
+def appointment_calendar_page():
+    st.title("📅 Appointment Calendar")
+
+    tab1, tab2, tab3 = st.tabs([
+        "📆 Weekly Calendar", "➕ Book Appointment", "📋 All Appointments"
+    ])
+
+    # ---- Tab 1: Weekly real-time calendar ----
+    with tab1:
+        st.subheader("Weekly View")
+
+        # Week navigation
+        today = datetime.now().date()
+        if "cal_week_start" not in st.session_state:
+            # Start week on Monday
+            st.session_state.cal_week_start = today - timedelta(days=today.weekday())
+
+        week_start = st.session_state.cal_week_start
+        week_end = week_start + timedelta(days=6)
+
+        col_prev, col_label, col_next = st.columns([1, 4, 1])
+        with col_prev:
+            if st.button("◀ Prev"):
+                st.session_state.cal_week_start -= timedelta(weeks=1)
+                st.rerun()
+        with col_label:
+            st.markdown(
+                f"<h4 style='text-align:center'>"
+                f"{week_start.strftime('%d %b')} – {week_end.strftime('%d %b %Y')}"
+                f"</h4>",
+                unsafe_allow_html=True
+            )
+        with col_next:
+            if st.button("Next ▶"):
+                st.session_state.cal_week_start += timedelta(weeks=1)
+                st.rerun()
+
+        if st.button("📍 Go to Today"):
+            st.session_state.cal_week_start = today - timedelta(days=today.weekday())
+            st.rerun()
+
+        # Doctor filter
+        doc_filter = st.selectbox(
+            "Filter by Doctor (optional)",
+            ["All Doctors"] + AppointmentCalendar.DOCTORS,
+            key="cal_doc_filter"
+        )
+
+        # Render 7-day grid
+        week_appts = appointment_calendar.week_range(week_start)
+        if doc_filter != "All Doctors":
+            week_appts = [a for a in week_appts if a["doctor"] == doc_filter]
+
+        days = [week_start + timedelta(days=i) for i in range(7)]
+        cols = st.columns(7)
+
+        status_colors = {
+            "Scheduled": "#3498db",
+            "Completed": "#27ae60",
+            "Cancelled": "#e74c3c",
+            "No Show": "#95a5a6",
+        }
+
+        for i, (col, day) in enumerate(zip(cols, days)):
+            with col:
+                is_today = (day == today)
+                header_style = (
+                    "background:#1a3c5e;color:white;padding:4px 6px;"
+                    "border-radius:4px;text-align:center;"
+                ) if is_today else (
+                    "background:#ecf0f1;padding:4px 6px;"
+                    "border-radius:4px;text-align:center;"
+                )
+                st.markdown(
+                    f"<div style='{header_style}'>"
+                    f"<b>{day.strftime('%a')}</b><br/>{day.strftime('%d %b')}"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+                day_appts = [a for a in week_appts if a["date"] == str(day)]
+                if day_appts:
+                    for a in sorted(day_appts, key=lambda x: x["time"]):
+                        color = status_colors.get(a["status"], "#3498db")
+                        st.markdown(
+                            f"<div style='background:{color};color:white;"
+                            f"border-radius:6px;padding:5px 7px;margin:4px 0;"
+                            f"font-size:11px;'>"
+                            f"<b>{a['time']}</b> · {a['duration_mins']}min<br/>"
+                            f"{a['patient_name']}<br/>"
+                            f"<span style='opacity:0.85'>{a['type']}</span><br/>"
+                            f"🩺 {a['doctor'].split()[-1]}"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+                else:
+                    st.markdown(
+                        "<div style='color:#aaa;font-size:11px;"
+                        "text-align:center;padding-top:8px'>No appointments</div>",
+                        unsafe_allow_html=True
+                    )
+
+        # Summary metrics for this week
+        st.markdown("---")
+        c1, c2, c3, c4 = st.columns(4)
+        week_all = appointment_calendar.week_range(week_start)
+        c1.metric("This Week Total", len(week_all))
+        c2.metric("Scheduled", sum(1 for a in week_all if a["status"] == "Scheduled"))
+        c3.metric("Completed", sum(1 for a in week_all if a["status"] == "Completed"))
+        c4.metric("Cancelled / No Show",
+                  sum(1 for a in week_all if a["status"] in ["Cancelled", "No Show"]))
+
+        # Today's schedule detail
+        st.markdown("---")
+        st.subheader(f"📋 Today's Schedule — {today.strftime('%A, %d %B %Y')}")
+        today_appts = appointment_calendar.for_date(str(today))
+        if doc_filter != "All Doctors":
+            today_appts = [a for a in today_appts if a["doctor"] == doc_filter]
+
+        if today_appts:
+            for a in today_appts:
+                color = status_colors.get(a["status"], "#3498db")
+                with st.expander(
+                    f"🕐 {a['time']} — {a['patient_name']} | "
+                    f"{a['type']} | {a['doctor']} | Status: {a['status']}"
+                ):
+                    c1, c2, c3 = st.columns(3)
+                    c1.write(f"**Patient ID:** {a['patient_id']}")
+                    c1.write(f"**Duration:** {a['duration_mins']} mins")
+                    c2.write(f"**Doctor:** {a['doctor']}")
+                    c2.write(f"**Type:** {a['type']}")
+                    c3.write(f"**Status:** {a['status']}")
+                    if a.get("notes"):
+                        st.info(f"📝 {a['notes']}")
+
+                    # Status update
+                    new_status = st.selectbox(
+                        "Update Status",
+                        AppointmentCalendar.STATUSES,
+                        index=AppointmentCalendar.STATUSES.index(a["status"]),
+                        key=f"status_{a['appt_id']}"
+                    )
+                    if st.button("💾 Save Status", key=f"save_{a['appt_id']}"):
+                        appointment_calendar.update_status(a["appt_id"], new_status)
+                        st.success(f"Status updated to {new_status}")
+                        st.rerun()
+        else:
+            st.info("No appointments scheduled for today.")
+
+    # ---- Tab 2: Book appointment ----
+    with tab2:
+        st.subheader("📝 Book New Appointment")
+
+        if not hospital_data.patients:
+            st.info("No patients registered yet.")
+        else:
+            with st.form("appt_form"):
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    patient_options = {
+                        f"{p['name']} ({p['patient_id']})": p
+                        for p in hospital_data.patients
+                    }
+                    sel_label = st.selectbox("Patient *", list(patient_options.keys()))
+                    sel_patient = patient_options[sel_label]
+
+                    appt_date = st.date_input(
+                        "Appointment Date *",
+                        value=datetime.now().date() + timedelta(days=1),
+                        min_value=datetime.now().date()
+                    )
+                    appt_time = st.time_input(
+                        "Appointment Time *",
+                        value=datetime.strptime("09:00", "%H:%M").time()
+                    )
+                    duration = st.selectbox(
+                        "Duration (minutes) *",
+                        AppointmentCalendar.DURATIONS, index=2
+                    )
+
+                with col2:
+                    doctor = st.selectbox("Assigned Doctor *",
+                                          AppointmentCalendar.DOCTORS)
+                    appt_type = st.selectbox("Appointment Type *",
+                                             AppointmentCalendar.APPT_TYPES)
+                    notes = st.text_area("Notes / Reason",
+                                         placeholder="Key concerns, test results to discuss...",
+                                         height=100)
+
+                    # Conflict check hint
+                    st.caption(
+                        "ℹ️ Check the Weekly Calendar tab to avoid double-booking."
+                    )
+
+                if st.form_submit_button("📅 Book Appointment"):
+                    # Basic conflict check
+                    existing = appointment_calendar.for_date(str(appt_date))
+                    conflict = any(
+                        a["doctor"] == doctor and a["time"] == appt_time.strftime("%H:%M")
+                        and a["status"] == "Scheduled"
+                        for a in existing
+                    )
+                    if conflict:
+                        st.error(
+                            f"⚠️  {doctor} already has a scheduled appointment at "
+                            f"{appt_time.strftime('%H:%M')} on {appt_date}. "
+                            "Please choose a different time."
+                        )
+                    else:
+                        record = {
+                            "patient_id": sel_patient["patient_id"],
+                            "patient_name": sel_patient["name"],
+                            "doctor": doctor,
+                            "date": str(appt_date),
+                            "time": appt_time.strftime("%H:%M"),
+                            "duration_mins": duration,
+                            "type": appt_type,
+                            "notes": notes,
+                            "status": "Scheduled",
+                        }
+                        appt_id = appointment_calendar.add(record)
+                        st.success(
+                            f"✅ Appointment booked! ID: **{appt_id}**  \n"
+                            f"**{sel_patient['name']}** → {doctor}  \n"
+                            f"📅 {appt_date.strftime('%A, %d %B %Y')} at "
+                            f"{appt_time.strftime('%H:%M')} ({duration} mins)"
+                        )
+                        st.balloons()
+
+    # ---- Tab 3: All appointments table ----
+    with tab3:
+        st.subheader("All Appointments")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            f_doc = st.selectbox("Filter by Doctor",
+                                  ["All"] + AppointmentCalendar.DOCTORS, key="f_doc")
+        with col2:
+            f_status = st.selectbox("Filter by Status",
+                                     ["All"] + AppointmentCalendar.STATUSES, key="f_status")
+        with col3:
+            f_type = st.selectbox("Filter by Type",
+                                   ["All"] + AppointmentCalendar.APPT_TYPES, key="f_type")
+
+        appts = appointment_calendar.appointments
+        if f_doc != "All":
+            appts = [a for a in appts if a["doctor"] == f_doc]
+        if f_status != "All":
+            appts = [a for a in appts if a["status"] == f_status]
+        if f_type != "All":
+            appts = [a for a in appts if a["type"] == f_type]
+
+        appts_sorted = sorted(appts, key=lambda x: (x["date"], x["time"]))
+
+        if appts_sorted:
+            df = pd.DataFrame([{
+                "ID": a["appt_id"],
+                "Date": a["date"],
+                "Time": a["time"],
+                "Duration": f"{a['duration_mins']} min",
+                "Patient": a["patient_name"],
+                "Doctor": a["doctor"],
+                "Type": a["type"],
+                "Status": a["status"],
+                "Notes": a.get("notes", ""),
+            } for a in appts_sorted])
+            st.dataframe(df, use_container_width=True)
+
+            # Doctor workload chart
+            st.markdown("---")
+            col1, col2 = st.columns(2)
+            with col1:
+                doc_load = pd.Series(
+                    [a["doctor"] for a in appointment_calendar.appointments
+                     if a["status"] == "Scheduled"]
+                ).value_counts()
+                if not doc_load.empty:
+                    fig = px.bar(x=doc_load.index, y=doc_load.values,
+                                 title="Upcoming Appointments by Doctor",
+                                 labels={"x": "Doctor", "y": "Appointments"},
+                                 color_discrete_sequence=["#1a3c5e"])
+                    fig.update_layout(xaxis_tickangle=-20)
+                    st.plotly_chart(fig, use_container_width=True)
+
+            with col2:
+                type_counts = pd.Series(
+                    [a["type"] for a in appointment_calendar.appointments]
+                ).value_counts()
+                fig2 = px.pie(values=type_counts.values, names=type_counts.index,
+                              title="Appointment Types Distribution")
+                st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("No appointments match the selected filters.")
 
 
 # ==================== MAIN APP ====================
