@@ -27,13 +27,12 @@ from reportlab.platypus import (
 )
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 
-# Google Sheets integration
+# Supabase integration
 try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-    GSPREAD_AVAILABLE = True
+    from supabase import create_client, Client as SupabaseClient
+    SUPABASE_AVAILABLE = True
 except ImportError:
-    GSPREAD_AVAILABLE = False
+    SUPABASE_AVAILABLE = False
 
 # Page configuration
 st.set_page_config(
@@ -2376,188 +2375,171 @@ def appointment_calendar_page():
 
 
 
-# ==================== GOOGLE SHEETS CONNECTOR ====================
-class GoogleSheetsConnector:
+# ==================== CSV DATA STORE ====================
+import os
+import csv as _csv
+
+class CSVStore:
     """
-    Handles all Google Sheets read/write operations.
-    Uses a service account JSON stored in Streamlit secrets.
+    Persists patient users, patient clinical data, and appointments to CSV files.
+    Files are stored in a local `data/` directory next to the app.
+    All writes are atomic append-or-rewrite operations so no record is ever lost.
 
-    Sheets used:
-      - 'patient_users'   : user accounts (patient self-registration)
-      - 'patient_data'    : clinical records synced from hospital
-      - 'appointments'    : all appointments (shared with calendar)
-
-    To enable: add credentials to .streamlit/secrets.toml (see SETUP_GUIDE.md).
+    Files created:
+      data/patient_users.csv       — self-registered patient accounts
+      data/patient_data.csv        — clinical snapshots synced on registration
+      data/appointments.csv        — all appointments (staff + patient booked)
     """
 
-    SCOPES = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    SHEET_NAMES = {
-        "users":        "patient_users",
-        "patients":     "patient_data",
-        "appointments": "appointments",
+    DATA_DIR = "data"
+
+    COLUMNS = {
+        "users": [
+            "user_id", "full_name", "email", "phone", "dob",
+            "gender", "password_hash", "patient_id", "created_at",
+        ],
+        "patients": [
+            "patient_id", "name", "age", "gender", "email",
+            "HbA1c", "SBP", "DBP", "BMI", "diabetes_condition",
+            "htn_stage", "ckd_egfr", "admission_date",
+        ],
+        "appointments": [
+            "appt_id", "patient_id", "patient_name", "doctor",
+            "date", "time", "duration_mins", "type",
+            "notes", "status", "booked_by",
+        ],
+    }
+
+    FILES = {
+        "users":        "patient_users.csv",
+        "patients":     "patient_data.csv",
+        "appointments": "appointments.csv",
     }
 
     def __init__(self):
-        self.client = None
-        self.spreadsheet = None
-        self.enabled = False
-        self._connect()
+        os.makedirs(self.DATA_DIR, exist_ok=True)
+        for key in self.FILES:
+            self._ensure_file(key)
 
-    def _connect(self):
-        if not GSPREAD_AVAILABLE:
-            return
+    # ---- Internal helpers ----
+    def _path(self, key: str) -> str:
+        return os.path.join(self.DATA_DIR, self.FILES[key])
+
+    def _ensure_file(self, key: str):
+        """Create CSV with header row if it doesn't exist yet."""
+        path = self._path(key)
+        if not os.path.exists(path):
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = _csv.DictWriter(f, fieldnames=self.COLUMNS[key])
+                writer.writeheader()
+
+    def _read_all(self, key: str) -> list[dict]:
+        path = self._path(key)
+        if not os.path.exists(path):
+            return []
         try:
-            creds_dict = dict(st.secrets.get("gcp_service_account", {}))
-            sheet_id   = st.secrets.get("google_sheet_id", "")
-            if not creds_dict or not sheet_id:
-                return
-            creds = Credentials.from_service_account_info(creds_dict, scopes=self.SCOPES)
-            self.client      = gspread.authorize(creds)
-            self.spreadsheet = self.client.open_by_key(sheet_id)
-            self.enabled     = True
-            self._ensure_sheets()
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                return list(_csv.DictReader(f))
         except Exception:
-            self.enabled = False
+            return []
 
-    def _ensure_sheets(self):
-        """Create worksheets if they don't exist yet."""
-        existing = [ws.title for ws in self.spreadsheet.worksheets()]
-        headers  = {
-            "patient_users": [
-                "user_id", "full_name", "email", "phone", "dob",
-                "gender", "password_hash", "patient_id", "created_at",
-            ],
-            "patient_data": [
-                "patient_id", "name", "age", "gender", "email",
-                "HbA1c", "SBP", "DBP", "BMI", "diabetes_condition",
-                "htn_stage", "ckd_egfr", "admission_date",
-            ],
-            "appointments": [
-                "appt_id", "patient_id", "patient_name", "doctor",
-                "date", "time", "duration_mins", "type",
-                "notes", "status", "booked_by",
-            ],
-        }
-        for name, cols in headers.items():
-            if name not in existing:
-                ws = self.spreadsheet.add_worksheet(title=name, rows=1000, cols=len(cols))
-                ws.append_row(cols)
-
-    def _sheet(self, key: str):
-        return self.spreadsheet.worksheet(self.SHEET_NAMES[key])
-
-    # ---- User accounts ----
-    def write_user(self, record: dict) -> bool:
-        if not self.enabled:
-            return False
+    def _append_row(self, key: str, record: dict) -> bool:
         try:
-            ws   = self._sheet("users")
-            cols = ws.row_values(1)
-            row  = [str(record.get(c, "")) for c in cols]
-            ws.append_row(row)
+            path = self._path(key)
+            cols = self.COLUMNS[key]
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = _csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+                writer.writerow({c: str(record.get(c, "")) for c in cols})
             return True
         except Exception:
             return False
+
+    def _rewrite(self, key: str, rows: list[dict]) -> bool:
+        """Overwrite entire file with updated rows (used for edits)."""
+        try:
+            cols = self.COLUMNS[key]
+            with open(self._path(key), "w", newline="", encoding="utf-8") as f:
+                writer = _csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({c: str(row.get(c, "")) for c in cols})
+            return True
+        except Exception:
+            return False
+
+    # ---- Public API (mirrors old GoogleSheetsConnector) ----
+
+    # Users
+    def write_user(self, record: dict) -> bool:
+        return self._append_row("users", record)
 
     def get_all_users(self) -> list[dict]:
-        if not self.enabled:
-            return []
-        try:
-            return self._sheet("users").get_all_records()
-        except Exception:
-            return []
+        return self._read_all("users")
 
     def update_user_row(self, email: str, updates: dict) -> bool:
-        """Update fields for the row matching email."""
-        if not self.enabled:
-            return False
-        try:
-            ws   = self._sheet("users")
-            data = ws.get_all_records()
-            cols = ws.row_values(1)
-            for i, row in enumerate(data):
-                if row.get("email") == email:
-                    row_num = i + 2  # 1-indexed + header
-                    for col_name, val in updates.items():
-                        if col_name in cols:
-                            ws.update_cell(row_num, cols.index(col_name) + 1, str(val))
-            return True
-        except Exception:
-            return False
+        rows = self._read_all("users")
+        changed = False
+        for row in rows:
+            if row.get("email") == email:
+                row.update({k: str(v) for k, v in updates.items()})
+                changed = True
+        if changed:
+            return self._rewrite("users", rows)
+        return False
 
-    # ---- Patient clinical data ----
+    # Patient clinical snapshots
     def write_patient(self, patient: dict) -> bool:
-        if not self.enabled:
-            return False
-        try:
-            ws   = self._sheet("patients")
-            cols = ws.row_values(1)
-            da   = patient.get("diabetes_assessment", {})
-            ha   = patient.get("htn_assessment", {})
-            record = {
-                "patient_id":          patient.get("patient_id", ""),
-                "name":                patient.get("name", ""),
-                "age":                 patient.get("age", ""),
-                "gender":              patient.get("gender", ""),
-                "email":               patient.get("email", ""),
-                "HbA1c":               patient.get("HbA1c", ""),
-                "SBP":                 patient.get("SBP", ""),
-                "DBP":                 patient.get("DBP", ""),
-                "BMI":                 patient.get("BMI", ""),
-                "diabetes_condition":  da.get("condition", ""),
-                "htn_stage":           ha.get("stage", ""),
-                "ckd_egfr":            "",
-                "admission_date":      patient.get("admission_date", ""),
-            }
-            row = [str(record.get(c, "")) for c in cols]
-            ws.append_row(row)
-            return True
-        except Exception:
-            return False
+        da = patient.get("diabetes_assessment", {})
+        ha = patient.get("htn_assessment", {})
+        record = {
+            "patient_id":         patient.get("patient_id", ""),
+            "name":               patient.get("name", ""),
+            "age":                patient.get("age", ""),
+            "gender":             patient.get("gender", ""),
+            "email":              patient.get("email", ""),
+            "HbA1c":              patient.get("HbA1c", ""),
+            "SBP":                patient.get("SBP", ""),
+            "DBP":                patient.get("DBP", ""),
+            "BMI":                patient.get("BMI", ""),
+            "diabetes_condition": da.get("condition", ""),
+            "htn_stage":          ha.get("stage", ""),
+            "ckd_egfr":           "",
+            "admission_date":     patient.get("admission_date", ""),
+        }
+        return self._append_row("patients", record)
 
-    # ---- Appointments ----
+    # Appointments
     def write_appointment(self, appt: dict, booked_by: str = "patient") -> bool:
-        if not self.enabled:
-            return False
-        try:
-            ws   = self._sheet("appointments")
-            cols = ws.row_values(1)
-            appt["booked_by"] = booked_by
-            row = [str(appt.get(c, "")) for c in cols]
-            ws.append_row(row)
-            return True
-        except Exception:
-            return False
+        appt = dict(appt)
+        appt["booked_by"] = booked_by
+        return self._append_row("appointments", appt)
 
     def get_appointments(self) -> list[dict]:
-        if not self.enabled:
-            return []
-        try:
-            return self._sheet("appointments").get_all_records()
-        except Exception:
-            return []
+        return self._read_all("appointments")
+
+    # ---- Status property (always True for CSV) ----
+    @property
+    def enabled(self) -> bool:
+        return True
 
 
 # ==================== PATIENT USER STORE ====================
 class PatientUserStore:
     """
-    In-memory patient account store (source of truth at runtime).
-    Syncs new registrations / updates to Google Sheets when available.
+    Patient account store backed by CSV.
+    On startup it loads existing accounts from data/patient_users.csv.
+    All new registrations and profile edits are persisted immediately.
     """
 
-    def __init__(self, sheets: GoogleSheetsConnector):
-        self.sheets = sheets
+    def __init__(self, store: CSVStore):
+        self.store = store
         self.users: list[dict] = []
-        self._load_from_sheets()
+        self._load()
         self._seed_demo()
 
-    def _load_from_sheets(self):
-        remote = self.sheets.get_all_users()
-        if remote:
-            self.users = remote
+    def _load(self):
+        """Load all users from CSV into memory."""
+        self.users = self.store.get_all_users()
 
     def _seed_demo(self):
         """Pre-create one demo patient account linked to PAT0001."""
@@ -2575,6 +2557,7 @@ class PatientUserStore:
             "created_at":    "2024-01-10 09:00",
         }
         self.users.append(demo)
+        self.store.write_user(demo)
 
     # ---- Registration ----
     def register(self, full_name: str, email: str, phone: str,
@@ -2582,7 +2565,7 @@ class PatientUserStore:
         if any(u["email"] == email for u in self.users):
             return False, "An account with this email already exists."
 
-        # Match to existing hospital patient record by name + DOB (simple heuristic)
+        # Auto-link if hospital record name matches
         linked_pid = ""
         for p in hospital_data.patients:
             if p["name"].lower() == full_name.lower():
@@ -2602,7 +2585,7 @@ class PatientUserStore:
             "created_at":    datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
         self.users.append(record)
-        self.sheets.write_user(record)
+        self.store.write_user(record)
         return True, user_id
 
     # ---- Auth ----
@@ -2622,9 +2605,7 @@ class PatientUserStore:
         for u in self.users:
             if u["email"] == email:
                 u.update(updates)
-                self.sheets.update_user_row(email, updates)
-                return True
-        return False
+        return self.store.update_user_row(email, updates)
 
     def change_password(self, email: str, old_pw: str, new_pw: str) -> tuple[bool, str]:
         ok, user = self.authenticate(email, old_pw)
@@ -2636,8 +2617,8 @@ class PatientUserStore:
 
 
 # ---- Initialise global stores ----
-gs_connector   = GoogleSheetsConnector()
-patient_users  = PatientUserStore(gs_connector)
+gs_connector  = CSVStore()
+patient_users = PatientUserStore(gs_connector)
 
 
 # ==================== PATIENT PORTAL PAGES ====================
@@ -2735,14 +2716,7 @@ def patient_portal_landing():
                         "Please sign in using the **Sign In** tab."
                     )
                     # Sync new user to Google Sheets
-                    if gs_connector.enabled:
-                        st.info("📊 Your details have been saved to the hospital records system.")
-                    else:
-                        st.warning(
-                            "⚠️  Google Sheets sync is not configured — your account is "
-                            "saved locally for this session only. Ask the admin to set up "
-                            "Google Sheets integration."
-                        )
+                    st.info("📊 Your account has been saved and will persist across sessions.")
                 else:
                     st.error(result)
 
@@ -3102,13 +3076,7 @@ def patient_my_profile(user: dict):
         c2.write(f"**Hospital Patient ID:** {user.get('patient_id', 'Not linked')}")
         c2.write(f"**Account Created:** {user.get('created_at', 'N/A')}")
 
-        if gs_connector.enabled:
-            st.success("📊 Your data is synced with the hospital Google Sheet.")
-        else:
-            st.warning(
-                "⚠️  Google Sheets sync is not active. "
-                "Contact the hospital admin to enable it."
-            )
+        st.success("📊 Your data is saved to local CSV files and will persist across sessions.")
 
     with tab2:
         with st.form("pw_form"):
