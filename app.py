@@ -2391,7 +2391,7 @@ class CSVStore:
       data/appointments.csv        — all appointments (staff + patient booked)
     """
 
-    DATA_DIR = "data"
+    DATA_DIR = "."
 
     COLUMNS = {
         "users": [
